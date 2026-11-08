@@ -2500,3 +2500,215 @@ func Test_realSlurmControl_MakeNodeUndrain_invalidReg(t *testing.T) {
 		t.Errorf("MakeNodeUndrain() on INVALID_REG node error = %v, want %v", err, ErrNodeInvalidReg)
 	}
 }
+
+func newTestJob(id int32, nodes string, external bool, states ...api.V0044JobInfoJobState) types.V0044JobInfo {
+	job := types.V0044JobInfo{
+		V0044JobInfo: api.V0044JobInfo{
+			JobId:    ptr.To(id),
+			Nodes:    ptr.To(nodes),
+			JobState: ptr.To(states),
+		},
+	}
+	if external {
+		job.Flags = ptr.To([]api.V0044JobInfoFlags{api.V0044JobInfoFlagsEXTERNALJOB})
+	}
+	return job
+}
+
+func Test_externalJobsOnlyNodes(t *testing.T) {
+	running := api.V0044JobInfoJobStateRUNNING
+	tests := []struct {
+		name  string
+		jobs  []types.V0044JobInfo
+		nodes []string
+		want  map[string]int
+	}{
+		{
+			name:  "no jobs",
+			nodes: []string{"n1"},
+			want:  map[string]int{},
+		},
+		{
+			name:  "external only",
+			jobs:  []types.V0044JobInfo{newTestJob(1, "n1", true, running), newTestJob(2, "n1", true, running)},
+			nodes: []string{"n1"},
+			want:  map[string]int{"n1": 2},
+		},
+		{
+			name:  "native running blocks",
+			jobs:  []types.V0044JobInfo{newTestJob(1, "n1", true, running), newTestJob(2, "n1", false, running)},
+			nodes: []string{"n1"},
+			want:  map[string]int{},
+		},
+		{
+			name: "native completing blocks",
+			jobs: []types.V0044JobInfo{
+				newTestJob(1, "n1", true, running),
+				newTestJob(2, "n1", false, api.V0044JobInfoJobStateCOMPLETED, api.V0044JobInfoJobStateCOMPLETING),
+			},
+			nodes: []string{"n1"},
+			want:  map[string]int{},
+		},
+		{
+			name:  "native suspended blocks",
+			jobs:  []types.V0044JobInfo{newTestJob(1, "n1", true, running), newTestJob(2, "n1", false, api.V0044JobInfoJobStateSUSPENDED)},
+			nodes: []string{"n1"},
+			want:  map[string]int{},
+		},
+		{
+			name: "finished and pending jobs ignored",
+			jobs: []types.V0044JobInfo{
+				newTestJob(1, "n1", true, running),
+				newTestJob(2, "n1", false, api.V0044JobInfoJobStateCOMPLETED),
+				newTestJob(3, "n1", false, api.V0044JobInfoJobStateNODEFAIL),
+				newTestJob(4, "", false, api.V0044JobInfoJobStatePENDING),
+			},
+			nodes: []string{"n1"},
+			want:  map[string]int{"n1": 1},
+		},
+		{
+			name: "multi-node hostlist, native on one node only",
+			jobs: []types.V0044JobInfo{
+				newTestJob(1, "n[1-3]", true, running),
+				newTestJob(2, "n2", false, running),
+			},
+			nodes: []string{"n1", "n2", "n3"},
+			want:  map[string]int{"n1": 1, "n3": 1},
+		},
+		{
+			name:  "nodes outside the set ignored",
+			jobs:  []types.V0044JobInfo{newTestJob(1, "n1", true, running), newTestJob(2, "other", false, running)},
+			nodes: []string{"n1"},
+			want:  map[string]int{"n1": 1},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := externalJobsOnlyNodes(tt.jobs, set.New(tt.nodes...))
+			if err != nil {
+				t.Fatalf("externalJobsOnlyNodes() error = %v", err)
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("externalJobsOnlyNodes() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func Test_realSlurmControl_IsNodeDrainedExceptExternalJobs(t *testing.T) {
+	ctx := context.Background()
+	controller := &slinkyv1beta1.Controller{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "slurm",
+		},
+	}
+	nodeset := newNodeSet("foo", controller.Name, 1)
+	pod := nodesetutils.NewNodeSetStatefulSetPod(kubefake.NewFakeClient(), nodeset, controller, 0, "")
+	nodeName := nodesetutils.GetSlurmNodeName(pod)
+	running := api.V0044JobInfoJobStateRUNNING
+	newNode := func(states ...api.V0044NodeState) *types.V0044NodeList {
+		return &types.V0044NodeList{Items: []types.V0044Node{{
+			V0044Node: api.V0044Node{Name: ptr.To(nodeName), State: ptr.To(states)},
+		}}}
+	}
+	tests := []struct {
+		name    string
+		nodes   *types.V0044NodeList
+		jobs    []types.V0044JobInfo
+		noNode  bool
+		want    bool
+		wantErr bool
+	}{
+		{
+			name:  "drain, external jobs only",
+			nodes: newNode(api.V0044NodeStateMIXED, api.V0044NodeStateDRAIN),
+			jobs:  []types.V0044JobInfo{newTestJob(1, nodeName, true, running)},
+			want:  true,
+		},
+		{
+			name:  "drain, native job still running",
+			nodes: newNode(api.V0044NodeStateMIXED, api.V0044NodeStateDRAIN),
+			jobs:  []types.V0044JobInfo{newTestJob(1, nodeName, true, running), newTestJob(2, nodeName, false, running)},
+			want:  false,
+		},
+		{
+			name:  "not drain",
+			nodes: newNode(api.V0044NodeStateMIXED),
+			jobs:  []types.V0044JobInfo{newTestJob(1, nodeName, true, running)},
+			want:  false,
+		},
+		{
+			name:  "drain being undone",
+			nodes: newNode(api.V0044NodeStateMIXED, api.V0044NodeStateDRAIN, api.V0044NodeStateUNDRAIN),
+			jobs:  []types.V0044JobInfo{newTestJob(1, nodeName, true, running)},
+			want:  false,
+		},
+		{
+			name:  "drain, no jobs (left to IsNodeDrained)",
+			nodes: newNode(api.V0044NodeStateIDLE, api.V0044NodeStateDRAIN),
+			want:  false,
+		},
+		{
+			name:   "node not found",
+			nodes:  &types.V0044NodeList{},
+			noNode: true,
+			want:   false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			jobList := &types.V0044JobInfoList{Items: tt.jobs}
+			sclient := fake.NewClientBuilder().WithLists(tt.nodes, jobList).Build()
+			r := &realSlurmControl{clientMap: newSlurmClientMap(controller.Name, sclient)}
+			got, err := r.IsNodeDrainedExceptExternalJobs(ctx, nodeset, pod)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("IsNodeDrainedExceptExternalJobs() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if got != tt.want {
+				t.Errorf("IsNodeDrainedExceptExternalJobs() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func Test_realSlurmControl_CalculateNodeStatus_ExternalJobsOnly(t *testing.T) {
+	ctx := context.Background()
+	controller := &slinkyv1beta1.Controller{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "slurm",
+		},
+	}
+	nodeset := newNodeSet("foo", controller.Name, 2)
+	kclient := kubefake.NewFakeClient()
+	pod0 := nodesetutils.NewNodeSetStatefulSetPod(kclient, nodeset, controller, 0, "")
+	pod1 := nodesetutils.NewNodeSetStatefulSetPod(kclient, nodeset, controller, 1, "")
+	name0, name1 := nodesetutils.GetSlurmNodeName(pod0), nodesetutils.GetSlurmNodeName(pod1)
+	running := api.V0044JobInfoJobStateRUNNING
+	nodeList := &types.V0044NodeList{Items: []types.V0044Node{
+		{V0044Node: api.V0044Node{Name: ptr.To(name0), State: ptr.To([]api.V0044NodeState{api.V0044NodeStateMIXED})}},
+		{V0044Node: api.V0044Node{Name: ptr.To(name1), State: ptr.To([]api.V0044NodeState{api.V0044NodeStateMIXED})}},
+	}}
+	jobList := &types.V0044JobInfoList{Items: []types.V0044JobInfo{
+		newTestJob(1, name0, true, running),
+		newTestJob(2, name1, true, running),
+		newTestJob(3, name1, false, running),
+	}}
+	sclient := fake.NewClientBuilder().WithLists(nodeList, jobList).Build()
+	r := &realSlurmControl{clientMap: newSlurmClientMap(controller.Name, sclient)}
+
+	got, err := r.CalculateNodeStatus(ctx, nodeset, []*corev1.Pod{pod0, pod1})
+	if err != nil {
+		t.Fatalf("CalculateNodeStatus() error = %v", err)
+	}
+	has := func(node string) bool {
+		return slices.ContainsFunc(got.NodeStates[node], func(c corev1.PodCondition) bool {
+			return c.Type == slurmconditions.PodConditionExternalJobsOnly && c.Status == corev1.ConditionTrue
+		})
+	}
+	if !has(name0) {
+		t.Errorf("node %s (external job only) missing %s: %v", name0, slurmconditions.PodConditionExternalJobsOnly, got.NodeStates[name0])
+	}
+	if has(name1) {
+		t.Errorf("node %s (external + native job) has %s: %v", name1, slurmconditions.PodConditionExternalJobsOnly, got.NodeStates[name1])
+	}
+}

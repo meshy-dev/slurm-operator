@@ -1103,7 +1103,7 @@ func TestNodeSetReconciler_processCondemned(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			r := newNodeSetController(tt.fields.Client, tt.fields.ClientMap)
-			if err := r.processCondemned(tt.args.ctx, tt.args.nodeset, tt.args.condemned, tt.args.i); (err != nil) != tt.wantErr {
+			if err := r.processCondemned(tt.args.ctx, tt.args.nodeset, tt.args.condemned, tt.args.i, false); (err != nil) != tt.wantErr {
 				t.Errorf("NodeSetReconciler.processCondemned() error = %v, wantErr %v", err, tt.wantErr)
 			}
 			pod := tt.args.condemned[tt.args.i]
@@ -3714,6 +3714,79 @@ func Test_sanitizeSlurmReason(t *testing.T) {
 			if utf8.RuneCountInString(got) > maxSlurmReasonLength {
 				t.Errorf("sanitizeSlurmReason() returned %d runes, exceeds max %d",
 					utf8.RuneCountInString(got), maxSlurmReasonLength)
+			}
+		})
+	}
+}
+
+func TestNodeSetReconciler_processCondemned_UpdateIgnoreExternalJobs(t *testing.T) {
+	controller := &slinkyv1beta1.Controller{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "slurm",
+		},
+	}
+	tests := []struct {
+		name       string
+		annotate   bool
+		forUpdate  bool
+		nativeJob  bool
+		wantDelete bool
+	}{
+		{name: "update, opted in, external jobs only: delete", annotate: true, forUpdate: true, wantDelete: true},
+		{name: "update, opted in, native job running: wait", annotate: true, forUpdate: true, nativeJob: true},
+		{name: "update, not opted in: wait", forUpdate: true},
+		{name: "scale-in, opted in: wait", annotate: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			nodeset := newNodeSet("foo", controller.Name, 2)
+			if tt.annotate {
+				nodeset.Annotations = map[string]string{slinkyv1beta1.AnnotationUpdateIgnoreExternalJobs: "true"}
+			}
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Namespace: corev1.NamespaceDefault, Name: "pod-0"},
+				Spec:       corev1.PodSpec{Hostname: "foo-0"},
+				Status: corev1.PodStatus{
+					Phase:      corev1.PodRunning,
+					Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+				},
+			}
+			kclient := fake.NewFakeClient(nodeset, &corev1.PodList{Items: []corev1.Pod{*pod}})
+			nodeName := nodesetutils.GetSlurmNodeName(pod)
+			slurmNodeList := &slurmtypes.V0044NodeList{Items: []slurmtypes.V0044Node{{
+				V0044Node: slurmapi.V0044Node{
+					Name:  ptr.To(nodeName),
+					State: ptr.To([]slurmapi.V0044NodeState{slurmapi.V0044NodeStateMIXED, slurmapi.V0044NodeStateDRAIN}),
+				},
+			}}}
+			newJob := func(id int32, external bool) slurmtypes.V0044JobInfo {
+				job := slurmtypes.V0044JobInfo{V0044JobInfo: slurmapi.V0044JobInfo{
+					JobId:    ptr.To(id),
+					Nodes:    ptr.To(nodeName),
+					JobState: ptr.To([]slurmapi.V0044JobInfoJobState{slurmapi.V0044JobInfoJobStateRUNNING}),
+				}}
+				if external {
+					job.Flags = ptr.To([]slurmapi.V0044JobInfoFlags{slurmapi.V0044JobInfoFlagsEXTERNALJOB})
+				}
+				return job
+			}
+			jobList := &slurmtypes.V0044JobInfoList{Items: []slurmtypes.V0044JobInfo{newJob(1, true)}}
+			if tt.nativeJob {
+				jobList.Items = append(jobList.Items, newJob(2, false))
+			}
+			slurmClient := newFakeClientList(sinterceptor.Funcs{}, slurmNodeList, jobList)
+			r := newNodeSetController(kclient, newClientMap(controller.Name, slurmClient))
+
+			if err := r.processCondemned(context.TODO(), nodeset, []*corev1.Pod{pod}, 0, tt.forUpdate); err != nil {
+				t.Fatalf("processCondemned() error = %v", err)
+			}
+			err := r.Get(context.TODO(), client.ObjectKeyFromObject(pod), &corev1.Pod{})
+			deleted := apierrors.IsNotFound(err)
+			if err != nil && !deleted {
+				t.Fatalf("Get() error = %v", err)
+			}
+			if deleted != tt.wantDelete {
+				t.Errorf("pod deleted = %v, want %v", deleted, tt.wantDelete)
 			}
 		})
 	}

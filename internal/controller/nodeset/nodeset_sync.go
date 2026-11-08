@@ -883,6 +883,17 @@ func (r *NodeSetReconciler) doPodScale(
 	nodeset *slinkyv1beta1.NodeSet,
 	podsToKeep, podsToDelete, podsToCreate []*corev1.Pod,
 ) error {
+	return r.doPodScaleFor(ctx, nodeset, podsToKeep, podsToDelete, podsToCreate, false)
+}
+
+// doPodScaleFor is doPodScale where forUpdate marks podsToDelete as being
+// replaced by a RollingUpdate rather than removed by scale-in.
+func (r *NodeSetReconciler) doPodScaleFor(
+	ctx context.Context,
+	nodeset *slinkyv1beta1.NodeSet,
+	podsToKeep, podsToDelete, podsToCreate []*corev1.Pod,
+	forUpdate bool,
+) error {
 	logger := log.FromContext(ctx)
 	podsToKeep = nodesetutils.ExcludePods(podsToKeep, podsToDelete)
 	key := objectutils.KeyFunc(nodeset)
@@ -971,7 +982,7 @@ func (r *NodeSetReconciler) doPodScale(
 	deletePodFn := func(index int) error {
 		pod := podsToDelete[index]
 		podKey := kubecontroller.PodKey(pod)
-		if err := r.processCondemned(ctx, nodeset, podsToDelete, index); err != nil {
+		if err := r.processCondemned(ctx, nodeset, podsToDelete, index, forUpdate); err != nil {
 			// Decrement the expected number of deletes because the informer won't observe this deletion
 			r.expectations.DeletionObserved(logger, key, podKey)
 			if !apierrors.IsNotFound(err) {
@@ -1067,12 +1078,16 @@ func getPodKeys(pods []*corev1.Pod) []string {
 }
 
 // processCondemned will gracefully terminate the condemned NodeSet pod.
+// forUpdate is true when the pod is being replaced by a RollingUpdate (as
+// opposed to removed by scale-in), which allows AnnotationUpdateIgnoreExternalJobs
+// to apply.
 // NOTE: intended to be used by utils.SlowStartBatch().
 func (r *NodeSetReconciler) processCondemned(
 	ctx context.Context,
 	nodeset *slinkyv1beta1.NodeSet,
 	condemned []*corev1.Pod,
 	i int,
+	forUpdate bool,
 ) error {
 	logger := klog.FromContext(ctx)
 	pod := condemned[i]
@@ -1091,6 +1106,18 @@ func (r *NodeSetReconciler) processCondemned(
 	isDrained, err := r.slurmControl.IsNodeDrained(ctx, nodeset, pod)
 	if err != nil {
 		return err
+	}
+
+	if !isDrained && forUpdate && updateIgnoresExternalJobs(nodeset) {
+		onlyExternal, err := r.slurmControl.IsNodeDrainedExceptExternalJobs(ctx, nodeset, pod)
+		if err != nil {
+			return err
+		}
+		if onlyExternal {
+			logger.Info("NodeSet Pod is drained except for external jobs, terminating for update",
+				"pod", klog.KObj(pod), "annotation", slinkyv1beta1.AnnotationUpdateIgnoreExternalJobs)
+			isDrained = true
+		}
 	}
 
 	if !isDrained {
@@ -1113,6 +1140,12 @@ func (r *NodeSetReconciler) processCondemned(
 		}
 	}
 	return nil
+}
+
+// updateIgnoresExternalJobs reports whether the NodeSet opted in to replacing
+// pods during a RollingUpdate while external jobs still run on their node.
+func updateIgnoresExternalJobs(nodeset *slinkyv1beta1.NodeSet) bool {
+	return nodeset.GetAnnotations()[slinkyv1beta1.AnnotationUpdateIgnoreExternalJobs] == "true"
 }
 
 // doPodProcessing handles batch processing of NodeSet pods.
@@ -1144,7 +1177,7 @@ func (r *NodeSetReconciler) doPodProcessing(
 	deletePodFn := func(index int) error {
 		pod := podsToDelete[index]
 		podKey := kubecontroller.PodKey(pod)
-		if err := r.processCondemned(ctx, nodeset, podsToDelete, index); err != nil {
+		if err := r.processCondemned(ctx, nodeset, podsToDelete, index, false); err != nil {
 			// Decrement the expected number of deletes because the informer won't observe this deletion
 			r.expectations.DeletionObserved(logger, key, podKey)
 			if !apierrors.IsNotFound(err) {
@@ -1358,7 +1391,7 @@ func (r *NodeSetReconciler) syncRollingUpdate(
 	if len(podsToDelete) > 0 {
 		logger.Info("Scale-in pods for Rolling Update",
 			"delete", len(podsToDelete))
-		if err := r.doPodScale(ctx, nodeset, nil, podsToDelete, nil); err != nil {
+		if err := r.doPodScaleFor(ctx, nodeset, nil, podsToDelete, nil, true); err != nil {
 			return err
 		}
 	}

@@ -6,8 +6,10 @@ package slurmcontrol
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -48,6 +50,9 @@ type SlurmControlInterface interface {
 	IsNodeDrain(ctx context.Context, nodeset *slinkyv1beta1.NodeSet, pod *corev1.Pod) (bool, error)
 	// IsNodeDrained checks if the slurm node is drained.
 	IsNodeDrained(ctx context.Context, nodeset *slinkyv1beta1.NodeSet, pod *corev1.Pod) (bool, error)
+	// IsNodeDrainedExceptExternalJobs checks if the slurm node has the DRAIN
+	// state and the only jobs still holding resources on it are external jobs.
+	IsNodeDrainedExceptExternalJobs(ctx context.Context, nodeset *slinkyv1beta1.NodeSet, pod *corev1.Pod) (bool, error)
 	// IsNodeDownForUnresponsive checks if the slurm node is unresponsive
 	IsNodeDownForUnresponsive(ctx context.Context, nodeset *slinkyv1beta1.NodeSet, pod *corev1.Pod) (bool, error)
 	// IsNodeReasonOurs reports if the node reason was set by the operator.
@@ -358,6 +363,44 @@ func (r *realSlurmControl) IsNodeDrained(ctx context.Context, nodeset *slinkyv1b
 	return isDrained, nil
 }
 
+// IsNodeDrainedExceptExternalJobs implements SlurmControlInterface.
+func (r *realSlurmControl) IsNodeDrainedExceptExternalJobs(ctx context.Context, nodeset *slinkyv1beta1.NodeSet, pod *corev1.Pod) (bool, error) {
+	logger := log.FromContext(ctx)
+
+	slurmClient := r.lookupClient(nodeset)
+	if slurmClient == nil {
+		logger.V(2).Info("no client for nodeset, cannot do IsNodeDrainedExceptExternalJobs()",
+			"pod", klog.KObj(pod))
+		return false, nil
+	}
+
+	nodeName := nodesetutils.GetSlurmNodeName(pod)
+	slurmNode := &slurmtypes.V0044Node{}
+	key := slurmobject.ObjectKey(nodeName)
+	if err := slurmClient.Get(ctx, key, slurmNode, &slurmclient.GetOptions{RefreshCache: true}); err != nil {
+		if tolerateError(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	state := slurmNode.GetStateAsSet()
+	if !state.Has(slurmapi.V0044NodeStateDRAIN) || state.Has(slurmapi.V0044NodeStateUNDRAIN) {
+		return false, nil
+	}
+
+	// This decides whether to terminate the pod, so read jobs fresh.
+	jobList := &slurmtypes.V0044JobInfoList{}
+	if err := slurmClient.List(ctx, jobList, &slurmclient.ListOptions{RefreshCache: true}); err != nil {
+		return false, err
+	}
+	externalOnly, err := externalJobsOnlyNodes(jobList.Items, set.New(nodeName))
+	if err != nil {
+		return false, err
+	}
+	_, ok := externalOnly[nodeName]
+	return ok, nil
+}
+
 // IsNodeDownForUnresponsive implements SlurmControlInterface.
 func (r *realSlurmControl) IsNodeDownForUnresponsive(ctx context.Context, nodeset *slinkyv1beta1.NodeSet, pod *corev1.Pod) (bool, error) {
 	logger := log.FromContext(ctx)
@@ -550,7 +593,80 @@ func (r *realSlurmControl) CalculateNodeStatus(ctx context.Context, nodeset *sli
 		}
 	}
 
+	// Derived from jobs: mark nodes whose only work is external jobs. Failing
+	// to read jobs leaves the condition unset (the conservative answer)
+	// rather than failing the node status.
+	jobList := &slurmtypes.V0044JobInfoList{}
+	if err := slurmClient.List(ctx, jobList); err != nil {
+		logger.Error(err, "failed to list jobs, not setting external-jobs-only conditions")
+		return status, nil
+	}
+	externalOnly, err := externalJobsOnlyNodes(jobList.Items, podNodeNameSet)
+	if err != nil {
+		logger.Error(err, "failed to map jobs to nodes, not setting external-jobs-only conditions")
+		return status, nil
+	}
+	for nodeName, numJobs := range externalOnly {
+		if _, ok := status.NodeStates[nodeName]; !ok {
+			continue // not a registered Slurm node of this NodeSet
+		}
+		status.NodeStates[nodeName] = append(status.NodeStates[nodeName], corev1.PodCondition{
+			Type:    slurmconditions.PodConditionExternalJobsOnly,
+			Status:  corev1.ConditionTrue,
+			Message: fmt.Sprintf("%d external job(s), no slurmd-launched jobs", numJobs),
+		})
+	}
+
 	return status, nil
+}
+
+// isJobHoldingResources reports whether a job currently holds resources on its
+// nodes: running, suspended, or still completing.
+func isJobHoldingResources(job *slurmtypes.V0044JobInfo) bool {
+	return job.GetStateAsSet().HasAny(
+		slurmapi.V0044JobInfoJobStateRUNNING,
+		slurmapi.V0044JobInfoJobStateSUSPENDED,
+		slurmapi.V0044JobInfoJobStateCOMPLETING,
+	)
+}
+
+// isExternalJob reports whether the job has the EXTERNAL_JOB flag, i.e. its
+// workload runs outside slurmd (e.g. a slurm-bridge pod).
+func isExternalJob(job *slurmtypes.V0044JobInfo) bool {
+	return slices.Contains(ptr.Deref(job.Flags, nil), slurmapi.V0044JobInfoFlagsEXTERNALJOB)
+}
+
+// externalJobsOnlyNodes returns, for each node in nodeNames that has at least
+// one job holding resources and no non-external job holding resources, the
+// number of external jobs on it.
+func externalJobsOnlyNodes(jobs []slurmtypes.V0044JobInfo, nodeNames set.Set[string]) (map[string]int, error) {
+	external := make(map[string]int)
+	native := set.New[string]()
+	for i := range jobs {
+		job := &jobs[i]
+		if !isJobHoldingResources(job) {
+			continue
+		}
+		jobNodes, err := hostlist.Expand(ptr.Deref(job.Nodes, ""))
+		if err != nil {
+			return nil, fmt.Errorf("failed to expand node hostlist of job %d: %w", ptr.Deref(job.JobId, 0), err)
+		}
+		isExternal := isExternalJob(job)
+		for _, nodeName := range jobNodes {
+			if !nodeNames.Has(nodeName) {
+				continue
+			}
+			if isExternal {
+				external[nodeName]++
+			} else {
+				native.Insert(nodeName)
+			}
+		}
+	}
+	for nodeName := range native {
+		delete(external, nodeName)
+	}
+	return external, nil
 }
 
 const infiniteDuration = time.Duration(math.MaxInt64)

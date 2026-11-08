@@ -28,6 +28,16 @@ const (
 	// workload by. Pods with an earlier deadline are preferred to be deleted before pods with a later deadline.
 	// NOTE: this is honored on a best-effort basis, and does not offer guarantees on pod deletion order.
 	AnnotationPodDeadline = NodeSetPrefix + "pod-deadline"
+
+	// AnnotationUpdateIgnoreExternalJobs, when "true" on a NodeSet, lets a
+	// RollingUpdate replace a drained pod whose Slurm node still runs external
+	// jobs (EXTERNAL_JOB flag, e.g. slurm-bridge workloads that run outside
+	// slurmd), instead of waiting for them to end. Jobs launched by slurmd still
+	// drain first. Only meaningful with a slurmctld that keeps external jobs
+	// submitted with kill_on_node_fail=0 through a node DOWN; with stock Slurm
+	// those jobs fail with NODE_FAIL when the pod's preStop marks the node DOWN.
+	// Scale-in is unaffected: it always waits for the node to drain fully.
+	AnnotationUpdateIgnoreExternalJobs = NodeSetPrefix + "update-ignore-external-jobs"
 )
 
 // Well Known Annotations for Objects of type corev1.Node

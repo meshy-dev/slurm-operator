@@ -4,6 +4,8 @@
 package conditions
 
 import (
+	"strings"
+
 	corev1 "k8s.io/api/core/v1"
 	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
 )
@@ -29,7 +31,21 @@ const (
 	PodConditionMaintenance   corev1.PodConditionType = StatePrefix + "Maintenance"
 	PodConditionNotResponding corev1.PodConditionType = StatePrefix + "NotResponding"
 	PodConditionUndrain       corev1.PodConditionType = StatePrefix + "Undrain"
+
+	// PodConditionExternalJobsOnly is derived from Slurm jobs, not a Slurm node
+	// state: it is True when at least one job holds resources on the Slurm
+	// node and every such job is an external job (EXTERNAL_JOB flag), i.e. no
+	// job launched by slurmd is running, suspended or completing there. It is
+	// absent otherwise, including when jobs could not be read.
+	PodConditionExternalJobsOnly corev1.PodConditionType = "SlurmNodeExternalJobsOnly"
 )
+
+// IsSlurmCondition reports whether condType is a pod condition the operator
+// derives from Slurm and keeps in sync (adding and removing it).
+func IsSlurmCondition(condType corev1.PodConditionType) bool {
+	return strings.HasPrefix(string(condType), StatePrefix) ||
+		condType == PodConditionExternalJobsOnly
+}
 
 func IsConditionTrue(status *corev1.PodStatus, condType corev1.PodConditionType) bool {
 	_, cond := podutil.GetPodCondition(status, condType)
