@@ -36,8 +36,18 @@ const (
 	// drain first. Only meaningful with a slurmctld that keeps external jobs
 	// submitted with kill_on_node_fail=0 through a node DOWN; with stock Slurm
 	// those jobs fail with NODE_FAIL when the pod's preStop marks the node DOWN.
-	// Scale-in is unaffected: it always waits for the node to drain fully.
+	// Scale-in is unaffected: it always waits for the node to drain fully. So
+	// are StatefulSet pods without hostNetwork: their Slurm node name is the
+	// ordinal hostname, so a replacement could come back on another host.
 	AnnotationUpdateIgnoreExternalJobs = NodeSetPrefix + "update-ignore-external-jobs"
+
+	// AnnotationPodExternalJobsOnly is "true" on a NodeSet Pod whose Slurm node
+	// is drained and still has jobs, all of them external jobs (EXTERNAL_JOB
+	// flag); it is only set where the Slurm node name is tied to the host
+	// (DaemonSet mode, or StatefulSet with hostNetwork). It is absent otherwise.
+	// Admission policies can use it to allow replacing such a Pod.
+	// This annotation is managed by the operator.
+	AnnotationPodExternalJobsOnly = NodeSetPrefix + "pod-external-jobs-only"
 )
 
 // Well Known Annotations for Objects of type corev1.Node

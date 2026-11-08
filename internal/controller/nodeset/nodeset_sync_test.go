@@ -52,6 +52,7 @@ import (
 	"github.com/SlinkyProject/slurm-operator/internal/utils/historycontrol"
 	"github.com/SlinkyProject/slurm-operator/internal/utils/podutils"
 	"github.com/SlinkyProject/slurm-operator/internal/utils/structutils"
+	slurmconditions "github.com/SlinkyProject/slurm-operator/pkg/conditions"
 	slurmtaints "github.com/SlinkyProject/slurm-operator/pkg/taints"
 )
 
@@ -3726,16 +3727,20 @@ func TestNodeSetReconciler_processCondemned_UpdateIgnoreExternalJobs(t *testing.
 		},
 	}
 	tests := []struct {
-		name       string
-		annotate   bool
-		forUpdate  bool
-		nativeJob  bool
-		wantDelete bool
+		name      string
+		annotate  bool
+		forUpdate bool
+		nativeJob bool
+		// podNetworkStatefulSet: Slurm node name is the ordinal hostname,
+		// not tied to the host.
+		podNetworkStatefulSet bool
+		wantDelete            bool
 	}{
 		{name: "update, opted in, external jobs only: delete", annotate: true, forUpdate: true, wantDelete: true},
 		{name: "update, opted in, native job running: wait", annotate: true, forUpdate: true, nativeJob: true},
 		{name: "update, not opted in: wait", forUpdate: true},
 		{name: "scale-in, opted in: wait", annotate: true},
+		{name: "update, opted in, StatefulSet on the pod network: wait", annotate: true, forUpdate: true, podNetworkStatefulSet: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -3744,12 +3749,15 @@ func TestNodeSetReconciler_processCondemned_UpdateIgnoreExternalJobs(t *testing.
 				nodeset.Annotations = map[string]string{slinkyv1beta1.AnnotationUpdateIgnoreExternalJobs: "true"}
 			}
 			pod := &corev1.Pod{
-				ObjectMeta: metav1.ObjectMeta{Namespace: corev1.NamespaceDefault, Name: "pod-0"},
+				ObjectMeta: metav1.ObjectMeta{Namespace: corev1.NamespaceDefault, Name: "pod-0", Labels: map[string]string{}},
 				Spec:       corev1.PodSpec{Hostname: "foo-0"},
 				Status: corev1.PodStatus{
 					Phase:      corev1.PodRunning,
 					Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
 				},
+			}
+			if tt.podNetworkStatefulSet {
+				pod.Labels[slinkyv1beta1.LabelNodeSetScalingMode] = string(slinkyv1beta1.ScalingModeStatefulset)
 			}
 			kclient := fake.NewFakeClient(nodeset, &corev1.PodList{Items: []corev1.Pod{*pod}})
 			nodeName := nodesetutils.GetSlurmNodeName(pod)
@@ -3787,6 +3795,76 @@ func TestNodeSetReconciler_processCondemned_UpdateIgnoreExternalJobs(t *testing.
 			}
 			if deleted != tt.wantDelete {
 				t.Errorf("pod deleted = %v, want %v", deleted, tt.wantDelete)
+			}
+		})
+	}
+}
+
+func TestNodeSetReconciler_syncSlurmDeadline_ExternalJobsOnly(t *testing.T) {
+	controller := &slinkyv1beta1.Controller{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "slurm",
+		},
+	}
+	drain := corev1.PodCondition{Type: slurmconditions.PodConditionDrain, Status: corev1.ConditionTrue}
+	tests := []struct {
+		name        string
+		hostNetwork bool
+		drained     bool
+		nativeJob   bool
+		preset      bool // annotation already present from an earlier sync
+		want        bool
+	}{
+		{name: "drained, external only, hostNetwork", hostNetwork: true, drained: true, want: true},
+		{name: "not drained", hostNetwork: true},
+		{name: "drained, native job too", hostNetwork: true, drained: true, nativeJob: true},
+		{name: "drained, external only, StatefulSet on the pod network", drained: true},
+		{name: "stale annotation removed once a native job lands", hostNetwork: true, drained: true, nativeJob: true, preset: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			nodeset := newNodeSet("foo", controller.Name, 1)
+			pod := nodesetutils.NewNodeSetStatefulSetPod(fake.NewFakeClient(), nodeset, controller, 0, "")
+			pod.Spec.HostNetwork = tt.hostNetwork
+			pod.Spec.NodeName = "host-0"
+			if tt.drained {
+				pod.Status.Conditions = append(pod.Status.Conditions, drain)
+			}
+			if pod.Annotations == nil {
+				pod.Annotations = map[string]string{}
+			}
+			if tt.preset {
+				pod.Annotations[slinkyv1beta1.AnnotationPodExternalJobsOnly] = "true"
+			}
+			kclient := fake.NewFakeClient(nodeset, &corev1.PodList{Items: []corev1.Pod{*pod}})
+			nodeName := nodesetutils.GetSlurmNodeName(pod)
+			newJob := func(id int32, external bool) slurmtypes.V0044JobInfo {
+				job := slurmtypes.V0044JobInfo{V0044JobInfo: slurmapi.V0044JobInfo{
+					JobId:    ptr.To(id),
+					Nodes:    ptr.To(nodeName),
+					JobState: ptr.To([]slurmapi.V0044JobInfoJobState{slurmapi.V0044JobInfoJobStateRUNNING}),
+				}}
+				if external {
+					job.Flags = ptr.To([]slurmapi.V0044JobInfoFlags{slurmapi.V0044JobInfoFlagsEXTERNALJOB})
+				}
+				return job
+			}
+			jobList := &slurmtypes.V0044JobInfoList{Items: []slurmtypes.V0044JobInfo{newJob(1, true)}}
+			if tt.nativeJob {
+				jobList.Items = append(jobList.Items, newJob(2, false))
+			}
+			slurmClient := newFakeClientList(sinterceptor.Funcs{}, &slurmtypes.V0044NodeList{}, jobList)
+			r := newNodeSetController(kclient, newClientMap(controller.Name, slurmClient))
+
+			if err := r.syncSlurmDeadline(context.TODO(), nodeset, []*corev1.Pod{pod}); err != nil {
+				t.Fatalf("syncSlurmDeadline() error = %v", err)
+			}
+			got := &corev1.Pod{}
+			if err := r.Get(context.TODO(), client.ObjectKeyFromObject(pod), got); err != nil {
+				t.Fatalf("Get() error = %v", err)
+			}
+			if has := got.Annotations[slinkyv1beta1.AnnotationPodExternalJobsOnly] == "true"; has != tt.want {
+				t.Errorf("%s set = %v, want %v (annotations %v)", slinkyv1beta1.AnnotationPodExternalJobsOnly, has, tt.want, got.Annotations)
 			}
 		})
 	}

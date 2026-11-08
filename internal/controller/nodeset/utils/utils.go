@@ -300,6 +300,18 @@ func GetOrdinalPodName(nodeset *slinkyv1beta1.NodeSet, ordinal int) string {
 }
 
 // GetSlurmNodeName returns the Slurm node name.
+// IsSlurmNodeHostBound reports whether the pod's Slurm node name is tied to the
+// Kubernetes node it runs on, so a replacement pod can only register that Slurm
+// node from the same host: DaemonSet mode, or StatefulSet with hostNetwork
+// (see GetSlurmNodeName). A StatefulSet pod on the pod network keeps its
+// ordinal hostname wherever it is rescheduled.
+func IsSlurmNodeHostBound(pod *corev1.Pod) bool {
+	if pod.Labels[slinkyv1beta1.LabelNodeSetScalingMode] == string(slinkyv1beta1.ScalingModeStatefulset) {
+		return pod.Spec.HostNetwork
+	}
+	return true
+}
+
 func GetSlurmNodeName(pod *corev1.Pod) string {
 	if pod.Labels[slinkyv1beta1.LabelNodeSetScalingMode] == string(slinkyv1beta1.ScalingModeStatefulset) {
 		if pod.Spec.HostNetwork {

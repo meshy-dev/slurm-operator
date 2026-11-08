@@ -2192,13 +2192,13 @@ func Test_realSlurmControl_GetNodeDeadlines(t *testing.T) {
 			sclient := fake.NewClientBuilder().WithUpdateFn(slurmUpdateFn).WithLists(tt.fields.nodeList, tt.fields.jobList).Build()
 			controllerName := tt.args.nodeset.Spec.ControllerRef.Name
 			r := NewSlurmControl(newSlurmClientMap(controllerName, sclient))
-			got, err := r.GetNodeDeadlines(tt.args.ctx, tt.args.nodeset, tt.args.pods)
+			got, err := r.GetNodeJobs(tt.args.ctx, tt.args.nodeset, tt.args.pods)
 			if (err != nil) != tt.wantErr {
-				t.Errorf("GetNodeDeadlines() error = %v, wantErr %v", err, tt.wantErr)
+				t.Errorf("GetNodeJobs() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
 			for _, node := range tt.fields.nodeList.Items {
-				if ts := got.Peek(ptr.Deref(node.Name, "")); !ts.After(now) {
+				if ts := got.Deadlines.Peek(ptr.Deref(node.Name, "")); !ts.After(now) {
 					t.Errorf("timestamp = %v, after = %v", ts, ts.After(now))
 				}
 
@@ -2671,7 +2671,7 @@ func Test_realSlurmControl_IsNodeDrainedExceptExternalJobs(t *testing.T) {
 	}
 }
 
-func Test_realSlurmControl_CalculateNodeStatus_ExternalJobsOnly(t *testing.T) {
+func Test_realSlurmControl_GetNodeJobs_ExternalJobsOnly(t *testing.T) {
 	ctx := context.Background()
 	controller := &slinkyv1beta1.Controller{
 		ObjectMeta: metav1.ObjectMeta{
@@ -2684,31 +2684,21 @@ func Test_realSlurmControl_CalculateNodeStatus_ExternalJobsOnly(t *testing.T) {
 	pod1 := nodesetutils.NewNodeSetStatefulSetPod(kclient, nodeset, controller, 1, "")
 	name0, name1 := nodesetutils.GetSlurmNodeName(pod0), nodesetutils.GetSlurmNodeName(pod1)
 	running := api.V0044JobInfoJobStateRUNNING
-	nodeList := &types.V0044NodeList{Items: []types.V0044Node{
-		{V0044Node: api.V0044Node{Name: ptr.To(name0), State: ptr.To([]api.V0044NodeState{api.V0044NodeStateMIXED})}},
-		{V0044Node: api.V0044Node{Name: ptr.To(name1), State: ptr.To([]api.V0044NodeState{api.V0044NodeStateMIXED})}},
-	}}
 	jobList := &types.V0044JobInfoList{Items: []types.V0044JobInfo{
 		newTestJob(1, name0, true, running),
 		newTestJob(2, name1, true, running),
 		newTestJob(3, name1, false, running),
+		newTestJob(4, "other-node", true, running),
 	}}
-	sclient := fake.NewClientBuilder().WithLists(nodeList, jobList).Build()
+	sclient := fake.NewClientBuilder().WithLists(&types.V0044NodeList{}, jobList).Build()
 	r := &realSlurmControl{clientMap: newSlurmClientMap(controller.Name, sclient)}
 
-	got, err := r.CalculateNodeStatus(ctx, nodeset, []*corev1.Pod{pod0, pod1})
+	got, err := r.GetNodeJobs(ctx, nodeset, []*corev1.Pod{pod0, pod1})
 	if err != nil {
-		t.Fatalf("CalculateNodeStatus() error = %v", err)
+		t.Fatalf("GetNodeJobs() error = %v", err)
 	}
-	has := func(node string) bool {
-		return slices.ContainsFunc(got.NodeStates[node], func(c corev1.PodCondition) bool {
-			return c.Type == slurmconditions.PodConditionExternalJobsOnly && c.Status == corev1.ConditionTrue
-		})
-	}
-	if !has(name0) {
-		t.Errorf("node %s (external job only) missing %s: %v", name0, slurmconditions.PodConditionExternalJobsOnly, got.NodeStates[name0])
-	}
-	if has(name1) {
-		t.Errorf("node %s (external + native job) has %s: %v", name1, slurmconditions.PodConditionExternalJobsOnly, got.NodeStates[name1])
+	want := map[string]int{name0: 1}
+	if !reflect.DeepEqual(got.ExternalJobsOnly, want) {
+		t.Errorf("GetNodeJobs().ExternalJobsOnly = %v, want %v", got.ExternalJobsOnly, want)
 	}
 }

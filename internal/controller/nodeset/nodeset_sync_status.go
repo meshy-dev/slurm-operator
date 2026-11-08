@@ -6,6 +6,7 @@ package nodeset
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -261,7 +262,7 @@ func applySlurmPodConditions(status *corev1.PodStatus, desired []corev1.PodCondi
 	}
 	filtered := status.Conditions[:0]
 	for _, c := range status.Conditions {
-		if slurmconditions.IsSlurmCondition(c.Type) {
+		if strings.HasPrefix(string(c.Type), slurmconditions.StatePrefix) {
 			if !desiredTypes.Has(c.Type) {
 				continue // drop stale Slurm condition
 			}

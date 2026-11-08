@@ -577,11 +577,6 @@ func Test_applySlurmPodConditions(t *testing.T) {
 		Type:   corev1.PodReady,
 		Status: corev1.ConditionTrue,
 	}
-	externalJobsOnlyCondition := corev1.PodCondition{
-		Type:    slurmconditions.PodConditionExternalJobsOnly,
-		Status:  corev1.ConditionTrue,
-		Message: "1 external job(s), no slurmd-launched jobs",
-	}
 
 	cmpOpts := cmp.Options{
 		cmpopts.SortSlices(func(a, b corev1.PodCondition) bool {
@@ -598,18 +593,6 @@ func Test_applySlurmPodConditions(t *testing.T) {
 		wantNonSlurm     []corev1.PodCondition
 		wantNonSlurmOnly bool
 	}{
-		{
-			name:      "drops stale external-jobs-only condition",
-			initial:   []corev1.PodCondition{allocatedCondition, externalJobsOnlyCondition},
-			desired:   []corev1.PodCondition{allocatedCondition},
-			wantSlurm: []corev1.PodCondition{allocatedCondition},
-		},
-		{
-			name:      "adds external-jobs-only condition",
-			initial:   []corev1.PodCondition{allocatedCondition},
-			desired:   []corev1.PodCondition{allocatedCondition, externalJobsOnlyCondition},
-			wantSlurm: []corev1.PodCondition{allocatedCondition, externalJobsOnlyCondition},
-		},
 		{
 			name:      "adds desired conditions to empty status",
 			initial:   nil,
@@ -689,7 +672,7 @@ func Test_applySlurmPodConditions(t *testing.T) {
 func slurmPodConditions(status *corev1.PodStatus) []corev1.PodCondition {
 	var out []corev1.PodCondition
 	for _, c := range status.Conditions {
-		if slurmconditions.IsSlurmCondition(c.Type) {
+		if strings.HasPrefix(string(c.Type), slurmconditions.StatePrefix) {
 			out = append(out, c)
 		}
 	}
@@ -699,7 +682,7 @@ func slurmPodConditions(status *corev1.PodStatus) []corev1.PodCondition {
 func nonSlurmPodConditions(status *corev1.PodStatus) []corev1.PodCondition {
 	var out []corev1.PodCondition
 	for _, c := range status.Conditions {
-		if !slurmconditions.IsSlurmCondition(c.Type) {
+		if !strings.HasPrefix(string(c.Type), slurmconditions.StatePrefix) {
 			out = append(out, c)
 		}
 	}

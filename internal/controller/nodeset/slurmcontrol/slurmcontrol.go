@@ -59,8 +59,9 @@ type SlurmControlInterface interface {
 	IsNodeReasonOurs(ctx context.Context, nodeset *slinkyv1beta1.NodeSet, pod *corev1.Pod) (bool, error)
 	// CalculateNodeStatus returns the current state of the registered slurm nodes.
 	CalculateNodeStatus(ctx context.Context, nodeset *slinkyv1beta1.NodeSet, pods []*corev1.Pod) (SlurmNodeStatus, error)
-	// GetNodeDeadlines returns a map of node to its deadline time.Time calculated from running jobs.
-	GetNodeDeadlines(ctx context.Context, nodeset *slinkyv1beta1.NodeSet, pods []*corev1.Pod) (*timestore.TimeStore, error)
+	// GetNodeJobs returns, from one job list, each node's deadline calculated
+	// from running jobs and the nodes whose only jobs are external jobs.
+	GetNodeJobs(ctx context.Context, nodeset *slinkyv1beta1.NodeSet, pods []*corev1.Pod) (*NodeJobs, error)
 	// GetNodesForPods returns a list of Slurm nodes associated with the NodeSet pods.
 	GetNodesForPods(ctx context.Context, nodeset *slinkyv1beta1.NodeSet, pods []*corev1.Pod) ([]string, bool, error)
 }
@@ -593,30 +594,6 @@ func (r *realSlurmControl) CalculateNodeStatus(ctx context.Context, nodeset *sli
 		}
 	}
 
-	// Derived from jobs: mark nodes whose only work is external jobs. Failing
-	// to read jobs leaves the condition unset (the conservative answer)
-	// rather than failing the node status.
-	jobList := &slurmtypes.V0044JobInfoList{}
-	if err := slurmClient.List(ctx, jobList); err != nil {
-		logger.Error(err, "failed to list jobs, not setting external-jobs-only conditions")
-		return status, nil
-	}
-	externalOnly, err := externalJobsOnlyNodes(jobList.Items, podNodeNameSet)
-	if err != nil {
-		logger.Error(err, "failed to map jobs to nodes, not setting external-jobs-only conditions")
-		return status, nil
-	}
-	for nodeName, numJobs := range externalOnly {
-		if _, ok := status.NodeStates[nodeName]; !ok {
-			continue // not a registered Slurm node of this NodeSet
-		}
-		status.NodeStates[nodeName] = append(status.NodeStates[nodeName], corev1.PodCondition{
-			Type:    slurmconditions.PodConditionExternalJobsOnly,
-			Status:  corev1.ConditionTrue,
-			Message: fmt.Sprintf("%d external job(s), no slurmd-launched jobs", numJobs),
-		})
-	}
-
 	return status, nil
 }
 
@@ -671,15 +648,26 @@ func externalJobsOnlyNodes(jobs []slurmtypes.V0044JobInfo, nodeNames set.Set[str
 
 const infiniteDuration = time.Duration(math.MaxInt64)
 
-// GetNodeDeadlines implements SlurmControlInterface.
-func (r *realSlurmControl) GetNodeDeadlines(ctx context.Context, nodeset *slinkyv1beta1.NodeSet, pods []*corev1.Pod) (*timestore.TimeStore, error) {
+// NodeJobs is what the NodeSet controller derives from the Slurm jobs on its
+// nodes, computed from a single job list.
+type NodeJobs struct {
+	// Deadlines maps a Slurm node name to when its running jobs complete.
+	Deadlines *timestore.TimeStore
+	// ExternalJobsOnly maps a Slurm node name to its number of external jobs,
+	// for nodes where at least one job and only external jobs hold resources.
+	ExternalJobsOnly map[string]int
+}
+
+// GetNodeJobs implements SlurmControlInterface.
+func (r *realSlurmControl) GetNodeJobs(ctx context.Context, nodeset *slinkyv1beta1.NodeSet, pods []*corev1.Pod) (*NodeJobs, error) {
 	logger := log.FromContext(ctx)
 	ts := timestore.NewTimeStore(timestore.Greater)
+	nodeJobs := &NodeJobs{Deadlines: ts, ExternalJobsOnly: map[string]int{}}
 
 	slurmClient := r.lookupClient(nodeset)
 	if slurmClient == nil {
-		logger.V(2).Info("no client for nodeset, cannot do GetNodeDeadlines()")
-		return ts, nil
+		logger.V(2).Info("no client for nodeset, cannot do GetNodeJobs()")
+		return nodeJobs, nil
 	}
 
 	slurmNodeNamesSet := set.New[string]()
@@ -692,6 +680,13 @@ func (r *realSlurmControl) GetNodeDeadlines(ctx context.Context, nodeset *slinky
 	if err := slurmClient.List(ctx, jobList); err != nil {
 		return nil, err
 	}
+
+	externalOnly, err := externalJobsOnlyNodes(jobList.Items, slurmNodeNamesSet)
+	if err != nil {
+		logger.Error(err, "failed to map jobs to nodes")
+		return nil, err
+	}
+	nodeJobs.ExternalJobsOnly = externalOnly
 
 	for _, job := range jobList.Items {
 		if !job.GetStateAsSet().Has(slurmapi.V0044JobInfoJobStateRUNNING) {
@@ -723,7 +718,7 @@ func (r *realSlurmControl) GetNodeDeadlines(ctx context.Context, nodeset *slinky
 		}
 	}
 
-	return ts, nil
+	return nodeJobs, nil
 }
 
 // GetNodesForPods implements SlurmControlInterface.

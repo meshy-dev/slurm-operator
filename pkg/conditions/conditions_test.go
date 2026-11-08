@@ -355,17 +355,3 @@ func TestAreJobsRunning(t *testing.T) {
 		})
 	}
 }
-
-func TestIsSlurmCondition(t *testing.T) {
-	for condType, want := range map[corev1.PodConditionType]bool{
-		PodConditionIdle:             true,
-		PodConditionDrain:            true,
-		PodConditionExternalJobsOnly: true,
-		corev1.PodReady:              false,
-		"SlurmNodeSomethingElse":     false,
-	} {
-		if got := IsSlurmCondition(condType); got != want {
-			t.Errorf("IsSlurmCondition(%q) = %v, want %v", condType, got, want)
-		}
-	}
-}

@@ -47,6 +47,7 @@ import (
 	"github.com/SlinkyProject/slurm-operator/internal/utils/podcontrol"
 	"github.com/SlinkyProject/slurm-operator/internal/utils/podutils"
 	"github.com/SlinkyProject/slurm-operator/internal/utils/structutils"
+	slurmconditions "github.com/SlinkyProject/slurm-operator/pkg/conditions"
 	slurmtaints "github.com/SlinkyProject/slurm-operator/pkg/taints"
 )
 
@@ -503,13 +504,15 @@ func (r *NodeSetReconciler) syncSlurmNodes(
 	return nil
 }
 
-// syncSlurmDeadline handles the Slurm Node's workload completion deadline.
+// syncSlurmDeadline handles the annotations derived from the jobs on each pod's
+// Slurm node: the workload completion deadline, and whether only external jobs
+// remain on a drained node.
 func (r *NodeSetReconciler) syncSlurmDeadline(
 	ctx context.Context,
 	nodeset *slinkyv1beta1.NodeSet,
 	pods []*corev1.Pod,
 ) error {
-	nodeDeadlines, err := r.slurmControl.GetNodeDeadlines(ctx, nodeset, pods)
+	nodeJobs, err := r.slurmControl.GetNodeJobs(ctx, nodeset, pods)
 	if err != nil {
 		return err
 	}
@@ -517,13 +520,27 @@ func (r *NodeSetReconciler) syncSlurmDeadline(
 	syncSlurmDeadlineFn := func(i int) error {
 		pod := pods[i]
 		slurmNodeName := nodesetutils.GetSlurmNodeName(pod)
-		deadline := nodeDeadlines.Peek(slurmNodeName)
+		deadline := nodeJobs.Deadlines.Peek(slurmNodeName)
+		// Only on a drained node (no new jobs can start, so this stays true until
+		// undrain) and only where the Slurm node name is tied to its host (a
+		// replacement slurmd cannot come back elsewhere with the allocation).
+		externalJobsOnly := nodeJobs.ExternalJobsOnly[slurmNodeName] > 0 &&
+			slurmconditions.IsNodeDrain(&pod.Status) &&
+			nodesetutils.IsSlurmNodeHostBound(pod)
 
 		mutateFn := func(pod *corev1.Pod) error {
+			if pod.Annotations == nil {
+				pod.Annotations = make(map[string]string)
+			}
 			if deadline.IsZero() {
 				delete(pod.Annotations, slinkyv1beta1.AnnotationPodDeadline)
 			} else {
 				pod.Annotations[slinkyv1beta1.AnnotationPodDeadline] = deadline.Format(time.RFC3339)
+			}
+			if externalJobsOnly {
+				pod.Annotations[slinkyv1beta1.AnnotationPodExternalJobsOnly] = "true"
+			} else {
+				delete(pod.Annotations, slinkyv1beta1.AnnotationPodExternalJobsOnly)
 			}
 			return nil
 		}
@@ -1108,7 +1125,10 @@ func (r *NodeSetReconciler) processCondemned(
 		return err
 	}
 
-	if !isDrained && forUpdate && updateIgnoresExternalJobs(nodeset) {
+	if !isDrained && forUpdate && updateIgnoresExternalJobs(nodeset) && !nodesetutils.IsSlurmNodeHostBound(pod) {
+		logger.V(1).Info("Not ignoring external jobs for update: the Slurm node name is not tied to its host (StatefulSet without hostNetwork)",
+			"pod", klog.KObj(pod), "annotation", slinkyv1beta1.AnnotationUpdateIgnoreExternalJobs)
+	} else if !isDrained && forUpdate && updateIgnoresExternalJobs(nodeset) {
 		onlyExternal, err := r.slurmControl.IsNodeDrainedExceptExternalJobs(ctx, nodeset, pod)
 		if err != nil {
 			return err
