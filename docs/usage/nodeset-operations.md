@@ -21,6 +21,7 @@ primitives. For design-level details, see
     - [Pod Deadline](#pod-deadline)
   - [Workload Disruption Protection](#workload-disruption-protection)
   - [Customizing the slurmd preStop Hook](#customizing-the-slurmd-prestop-hook)
+  - [Updates with External Jobs](#updates-with-external-jobs)
   - [External Drain Preservation](#external-drain-preservation)
   - [External Health Checker Integration Pattern](#external-health-checker-integration-pattern)
   - [Node Identity](#node-identity)
@@ -320,6 +321,64 @@ Points to keep in mind:
   it to finish before deleting the pod. A missing Slurm client or node record is
   treated as already drained. `spec.pruneSlurmNodeRecords` governs when the
   operator deletes defunct Slurm node records.
+
+## Updates with External Jobs
+
+External jobs (jobs with the `EXTERNAL_JOB` flag, such as slurm-bridge
+workloads) hold resources on a Slurm node, but their workload runs outside
+slurmd. By default an update treats them like any other job: it drains the node
+and waits for every job to end before replacing the pod, so long-running
+external jobs can stall an update indefinitely.
+
+Set the `nodeset.slinky.slurm.net/update-ignore-external-jobs` annotation to
+`"true"` (or any other value that Go's `strconv.ParseBool` accepts as true) on
+the NodeSet to let the operator replace a pod for an update once the only jobs
+left on its drained Slurm node are external jobs. This applies to every pod the
+operator replaces for an update: outdated and unhealthy pods under the
+`RollingUpdate` and `ScheduledUpdate` strategies. With `OnDelete`, the operator
+does not delete pods, so the annotation has no effect:
+
+```sh
+kubectl annotate nodeset <nodeset> nodeset.slinky.slurm.net/update-ignore-external-jobs=true
+```
+
+The node is still drained first, so no new work starts on it, and jobs launched
+by slurmd still run to completion before the pod is replaced. A pod only skips
+the wait when its replacement registers the same Slurm node name on the same
+host, so the external jobs' allocation stays with the machine where their
+workload runs. These cases still wait for the node to drain fully:
+
+- Scale-in and any other deletion that removes a pod rather than replacing it (a
+  DaemonSet node that leaves the NodeSet, or switching the NodeSet's scaling
+  mode), even when the update would also replace that pod.
+- Pods already at the current revision that a `ScheduledUpdate` maintenance
+  window recreates. Only outdated pods are replaced for the update.
+- Any change of the pod's Slurm node name: a changed
+  `nodeset.slinky.slurm.net/hostname-override` on a DaemonSet node, an update
+  that turns `hostNetwork` off, or StatefulSet mode without `hostNetwork`, where
+  the Slurm node name is the pod hostname and the replacement pod could register
+  it on another Kubernetes node.
+- A pod without a known `nodeset.slinky.slurm.net/scaling-mode` label.
+- A node whose remaining external jobs slurmctld would not keep: components of a
+  heterogeneous job, or jobs still configuring or suspended. They count like
+  jobs launched by slurmd.
+
+In StatefulSet mode with `hostNetwork`, the Slurm node name follows the host. A
+replacement pod scheduled on another host registers a different Slurm node; the
+old one stays DOWN, holding the allocation, until its external jobs end or a
+NodeSet pod returns to that host. Enable [node pinning](#node-pinning) on
+StatefulSet NodeSets that use this annotation to keep replacement pods on their
+host.
+
+> [!WARNING]
+> Only set this annotation when slurmctld keeps external jobs, and their
+> allocation, through a node DOWN, and when those jobs are submitted with
+> `kill_on_node_fail=0` (`--no-kill`). With stock Slurm, the default slurmd
+> [preStop hook](#customizing-the-slurmd-prestop-hook) sets the node DOWN, which
+> ends the external jobs with `NODE_FAIL`. Slurm job information does not report
+> `kill_on_node_fail`, so the operator cannot tell such jobs apart. After
+> switching a submitter to `--no-kill`, wait for the external jobs it submitted
+> before the switch to end before setting the annotation.
 
 ## External Drain Preservation
 

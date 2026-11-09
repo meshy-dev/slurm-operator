@@ -1107,3 +1107,32 @@ func TestSetOwnerReferences(t *testing.T) {
 		})
 	}
 }
+
+func TestIsSlurmNodeHostBound(t *testing.T) {
+	statefulset := map[string]string{slinkyv1beta1.LabelNodeSetScalingMode: string(slinkyv1beta1.ScalingModeStatefulset)}
+	daemonset := map[string]string{slinkyv1beta1.LabelNodeSetScalingMode: string(slinkyv1beta1.ScalingModeDaemonset)}
+	tests := []struct {
+		name        string
+		labels      map[string]string
+		hostNetwork bool
+		want        bool
+	}{
+		{name: "StatefulSet with hostNetwork", labels: statefulset, hostNetwork: true, want: true},
+		{name: "StatefulSet on the pod network", labels: statefulset, hostNetwork: false, want: false},
+		{name: "DaemonSet", labels: daemonset, want: true},
+		{name: "no scaling mode label", labels: nil, want: false},
+		{name: "no scaling mode label, hostNetwork", labels: nil, hostNetwork: true, want: false},
+		{name: "unknown scaling mode", labels: map[string]string{slinkyv1beta1.LabelNodeSetScalingMode: "Unknown"}, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Labels: tt.labels},
+				Spec:       corev1.PodSpec{HostNetwork: tt.hostNetwork},
+			}
+			if got := IsSlurmNodeHostBound(pod); got != tt.want {
+				t.Errorf("IsSlurmNodeHostBound() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}

@@ -138,7 +138,10 @@ sort order (see
 [Influencing Scale-in Order](../usage/nodeset-operations.md#influencing-scale-in-order))
 and then drains each selected pod's Slurm node before deleting it. A pod is
 never deleted until its Slurm node is fully drained, ensuring running jobs are
-not interrupted.
+not interrupted. Pods replaced by an update (RollingUpdate or ScheduledUpdate)
+follow the same lifecycle, except that a NodeSet can opt in to replacing pods
+whose drained node runs only external jobs (see
+[Updates with External Jobs](../usage/nodeset-operations.md#updates-with-external-jobs)).
 
 For practical usage of annotations, labels, and integration patterns, see
 [NodeSet Operations](../usage/nodeset-operations.md).

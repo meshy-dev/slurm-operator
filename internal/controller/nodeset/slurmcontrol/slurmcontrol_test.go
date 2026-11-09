@@ -3720,3 +3720,228 @@ func Test_realSlurmControl_DeleteNodeAlreadyGone(t *testing.T) {
 
 	require.ErrorIs(t, err, slurmerrors.ErrNotFound)
 }
+
+func newTestJob(id int32, nodes string, external bool, states ...api.V0044JobInfoJobState) api.V0044JobInfo {
+	job := api.V0044JobInfo{
+		JobId:    ptr.To(id),
+		Nodes:    ptr.To(nodes),
+		JobState: ptr.To(states),
+	}
+	if external {
+		job.Flags = ptr.To([]api.V0044JobInfoFlags{api.V0044JobInfoFlagsEXTERNALJOB})
+	}
+	return job
+}
+
+func Test_externalJobsOnlyNodes(t *testing.T) {
+	running := api.V0044JobInfoJobStateRUNNING
+	tests := []struct {
+		name    string
+		jobs    []api.V0044JobInfo
+		nodes   []string
+		want    []string
+		wantErr bool
+	}{
+		{
+			name:  "no jobs",
+			nodes: []string{"n1"},
+		},
+		{
+			name:  "external only",
+			jobs:  []api.V0044JobInfo{newTestJob(1, "n1", true, running), newTestJob(2, "n1", true, running)},
+			nodes: []string{"n1"},
+			want:  []string{"n1"},
+		},
+		{
+			name:  "native running blocks",
+			jobs:  []api.V0044JobInfo{newTestJob(1, "n1", true, running), newTestJob(2, "n1", false, running)},
+			nodes: []string{"n1"},
+		},
+		{
+			name: "native completing blocks",
+			jobs: []api.V0044JobInfo{
+				newTestJob(1, "n1", true, running),
+				newTestJob(2, "n1", false, api.V0044JobInfoJobStateCOMPLETED, api.V0044JobInfoJobStateCOMPLETING),
+			},
+			nodes: []string{"n1"},
+		},
+		{
+			name:  "native suspended blocks",
+			jobs:  []api.V0044JobInfo{newTestJob(1, "n1", true, running), newTestJob(2, "n1", false, api.V0044JobInfoJobStateSUSPENDED)},
+			nodes: []string{"n1"},
+		},
+		{
+			name: "finished and pending jobs ignored",
+			jobs: []api.V0044JobInfo{
+				newTestJob(1, "n1", true, running),
+				newTestJob(2, "n1", false, api.V0044JobInfoJobStateCOMPLETED),
+				newTestJob(3, "n1", false, api.V0044JobInfoJobStateNODEFAIL),
+				newTestJob(4, "", false, api.V0044JobInfoJobStatePENDING),
+			},
+			nodes: []string{"n1"},
+			want:  []string{"n1"},
+		},
+		{
+			name: "multi-node hostlist, native on one node only",
+			jobs: []api.V0044JobInfo{
+				newTestJob(1, "n[1-3]", true, running),
+				newTestJob(2, "n2", false, running),
+			},
+			nodes: []string{"n1", "n2", "n3"},
+			want:  []string{"n1", "n3"},
+		},
+		{
+			name:  "nodes outside the set ignored",
+			jobs:  []api.V0044JobInfo{newTestJob(1, "n1", true, running), newTestJob(2, "other", false, running)},
+			nodes: []string{"n1"},
+			want:  []string{"n1"},
+		},
+		{
+			// slurmctld fails every hetjob component together on a node
+			// failure, so it does not keep an external hetjob component.
+			name: "external hetjob component blocks",
+			jobs: func() []api.V0044JobInfo {
+				het := newTestJob(2, "n1", true, running)
+				het.HetJobId = &api.V0044Uint32NoValStruct{Set: ptr.To(true), Number: ptr.To(int32(2))}
+				return []api.V0044JobInfo{newTestJob(1, "n1", true, running), het}
+			}(),
+			nodes: []string{"n1"},
+			want:  []string{},
+		},
+		{
+			name: "unset hetjob id is not a hetjob",
+			jobs: func() []api.V0044JobInfo {
+				job := newTestJob(1, "n1", true, running)
+				job.HetJobId = &api.V0044Uint32NoValStruct{Set: ptr.To(false), Number: ptr.To(int32(0))}
+				return []api.V0044JobInfo{job}
+			}(),
+			nodes: []string{"n1"},
+			want:  []string{"n1"},
+		},
+		{
+			// A job still configuring (its nodes booting) is not kept.
+			name:  "configuring external job blocks",
+			jobs:  []api.V0044JobInfo{newTestJob(1, "n1", true, running), newTestJob(2, "n1", true, running, api.V0044JobInfoJobStateCONFIGURING)},
+			nodes: []string{"n1"},
+			want:  []string{},
+		},
+		{
+			// slurmctld keeps only a running job: one suspended before its
+			// node goes DOWN is killed.
+			name:  "suspended external job blocks",
+			jobs:  []api.V0044JobInfo{newTestJob(1, "n1", true, running), newTestJob(2, "n1", true, api.V0044JobInfoJobStateSUSPENDED)},
+			nodes: []string{"n1"},
+			want:  []string{},
+		},
+		{
+			name: "a job with unknown nodes leaves no node external-only",
+			jobs: []api.V0044JobInfo{
+				newTestJob(1, "n1", true, running),
+				newTestJob(2, "n[1-", false, running),
+			},
+			nodes:   []string{"n1"},
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := externalJobsOnlyNodes(tt.jobs, set.New(tt.nodes...))
+			if tt.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+			require.Equal(t, set.New(tt.want...), got)
+		})
+	}
+}
+
+func Test_realSlurmControl_GetExternalJobsOnlyNodes(t *testing.T) {
+	ctx := context.Background()
+	controller := &slinkyv1beta1.Controller{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: corev1.NamespaceDefault,
+			Name:      "slurm",
+		},
+	}
+	nodeset := newNodeSet("foo", controller.Name, 2)
+	kclient := kubefake.NewFakeClient()
+	pod0 := nodesetutils.NewNodeSetStatefulSetPod(kclient, nodeset, controller, 0, "")
+	pod1 := nodesetutils.NewNodeSetStatefulSetPod(kclient, nodeset, controller, 1, "")
+	name0, name1 := nodesetutils.GetSlurmNodeName(pod0), nodesetutils.GetSlurmNodeName(pod1)
+	running := api.V0044JobInfoJobStateRUNNING
+	drain := []api.V0044NodeState{api.V0044NodeStateMIXED, api.V0044NodeStateDRAIN}
+	newNodes := func(states0, states1 []api.V0044NodeState) *api.V0044NodeObjectList {
+		return &api.V0044NodeObjectList{Items: []api.V0044Node{
+			{Name: ptr.To(name0), State: ptr.To(states0)},
+			{Name: ptr.To(name1), State: ptr.To(states1)},
+		}}
+	}
+	tests := []struct {
+		name  string
+		nodes *api.V0044NodeObjectList
+		jobs  []api.V0044JobInfo
+		want  []string
+	}{
+		{
+			name:  "drain, external jobs only",
+			nodes: newNodes(drain, drain),
+			jobs:  []api.V0044JobInfo{newTestJob(1, name0, true, running), newTestJob(2, name1, true, running)},
+			want:  []string{name0, name1},
+		},
+		{
+			name:  "drain, native job still running on one node",
+			nodes: newNodes(drain, drain),
+			jobs: []api.V0044JobInfo{
+				newTestJob(1, name0, true, running), newTestJob(2, name1, true, running),
+				newTestJob(3, name1, false, running),
+			},
+			want: []string{name0},
+		},
+		{
+			name:  "not drain",
+			nodes: newNodes([]api.V0044NodeState{api.V0044NodeStateMIXED}, drain),
+			jobs:  []api.V0044JobInfo{newTestJob(1, name0, true, running), newTestJob(2, name1, true, running)},
+			want:  []string{name1},
+		},
+		{
+			name:  "drain being undone",
+			nodes: newNodes(append(drain, api.V0044NodeStateUNDRAIN), drain),
+			jobs:  []api.V0044JobInfo{newTestJob(1, name0, true, running), newTestJob(2, name1, true, running)},
+			want:  []string{name1},
+		},
+		{
+			name:  "drain, no jobs (left to IsNodeDrained)",
+			nodes: newNodes([]api.V0044NodeState{api.V0044NodeStateIDLE, api.V0044NodeStateDRAIN}, drain),
+		},
+		{
+			name:  "node not found",
+			nodes: &api.V0044NodeObjectList{},
+			jobs:  []api.V0044JobInfo{newTestJob(1, name0, true, running)},
+		},
+		{
+			name:  "a job with an unparsable node list leaves no node external-only",
+			nodes: newNodes(drain, drain),
+			jobs: []api.V0044JobInfo{
+				newTestJob(1, name0, true, running),
+				newTestJob(2, "n[1-", false, api.V0044JobInfoJobStateCOMPLETING),
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			jobList := &api.V0044JobInfoObjectList{Items: tt.jobs}
+			sclient := fake.NewClientBuilder().WithLists(tt.nodes, jobList).Build()
+			r := NewSlurmControl(testutils.NewClientMap(controller.Name, nodeset.Namespace, sclient))
+			got, err := r.GetExternalJobsOnlyNodes(ctx, nodeset, []*corev1.Pod{pod0, pod1})
+			require.NoError(t, err)
+			require.Equal(t, set.New(tt.want...), got)
+		})
+	}
+
+	t.Run("no client", func(t *testing.T) {
+		r := NewSlurmControl(clientmap.NewClientMap())
+		_, err := r.GetExternalJobsOnlyNodes(ctx, nodeset, []*corev1.Pod{pod0})
+		require.ErrorIs(t, err, ErrNoSlurmClient)
+	})
+}

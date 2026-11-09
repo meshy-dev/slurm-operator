@@ -43,6 +43,32 @@ const (
 	// workload by. Pods with an earlier deadline are preferred to be deleted before pods with a later deadline.
 	// NOTE: this is honored on a best-effort basis, and does not offer guarantees on pod deletion order.
 	AnnotationPodDeadline = NodeSetPrefix + "pod-deadline"
+
+	// AnnotationUpdateIgnoreExternalJobs, when true on a NodeSet, lets the update strategy replace a drained pod
+	// whose Slurm node still runs external jobs (EXTERNAL_JOB flag, e.g. slurm-bridge workloads that run outside
+	// slurmd), instead of waiting for them to end. This applies to every pod the operator replaces for an update:
+	// outdated and unhealthy pods under RollingUpdate and ScheduledUpdate. Jobs launched by slurmd still drain first.
+	// NOTE: this is only useful with a slurmctld that keeps external jobs submitted with kill_on_node_fail=0, and
+	// their allocation, through a node DOWN, and only when the external jobs are submitted that way. With stock
+	// Slurm, the default slurmd preStop hook sets the node DOWN and those jobs end with NODE_FAIL. External hetjob
+	// components and jobs still configuring or suspended are not kept by slurmctld, so they count like jobs launched by
+	// slurmd.
+	// A pod only skips the wait when its replacement registers the same Slurm node name on the same host, so the
+	// retained allocation stays with the machine its workload runs on. Everything else still waits for a full drain:
+	//   - scale-in and other removals (a DaemonSet node leaving the NodeSet, a scaling mode switch), including a pod
+	//     the update would also replace;
+	//   - pods already at the current revision that a ScheduledUpdate maintenance window recreates;
+	//   - any change of the pod's Slurm node name: a DaemonSet hostname override change, a StatefulSet without
+	//     hostNetwork (the Slurm node name is the pod hostname, which can move to another host), or an update that
+	//     turns hostNetwork off;
+	//   - pods without a known scaling mode.
+	// With StatefulSet and hostNetwork the Slurm node name follows the host. A replacement that lands on another host
+	// registers a different Slurm node, and the old one stays DOWN, holding the allocation, until its external jobs
+	// end or a NodeSet pod returns to that host; set ScaleStrategy.StatefulSet.PinToNode to keep replacements on
+	// their host.
+	// The value is parsed with strconv.ParseBool; any other value is treated as false.
+	// This annotation is managed by the user.
+	AnnotationUpdateIgnoreExternalJobs = NodeSetPrefix + "update-ignore-external-jobs"
 )
 
 // Well Known Annotations for Objects of type corev1.Node

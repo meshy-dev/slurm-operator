@@ -24,6 +24,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/sets"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/events"
 	"k8s.io/klog/v2"
@@ -51,6 +52,7 @@ import (
 	nodesetutils "github.com/SlinkyProject/slurm-operator/internal/controller/nodeset/utils"
 	eventutils "github.com/SlinkyProject/slurm-operator/internal/events"
 	"github.com/SlinkyProject/slurm-operator/internal/utils/historycontrol"
+	"github.com/SlinkyProject/slurm-operator/internal/utils/objectutils"
 	"github.com/SlinkyProject/slurm-operator/internal/utils/podinfo"
 	"github.com/SlinkyProject/slurm-operator/internal/utils/podutils"
 	"github.com/SlinkyProject/slurm-operator/internal/utils/structutils"
@@ -1526,7 +1528,7 @@ func TestNodeSetReconciler_processCondemned(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			r := newNodeSetController(tt.fields.Client, tt.fields.ClientMap)
-			err := r.processCondemned(tt.args.ctx, tt.args.nodeset, tt.args.condemned, tt.args.i)
+			err := r.processCondemned(tt.args.ctx, tt.args.nodeset, tt.args.condemned, tt.args.i, condemnRemove, nil)
 			if tt.wantErr {
 				require.Error(t, err)
 			} else {
@@ -5967,6 +5969,537 @@ func TestNodeSetReconciler_syncSlurmNodeRecordsAlwaysForPodTermination(t *testin
 				getErr := sclient.Get(ctx, slurmclient.ObjectKey(name), &slurmapi.V0044Node{})
 				require.ErrorIs(t, getErr, slurmerrors.ErrNotFound, "expected Slurm node %q to be pruned", name)
 			}
+		})
+	}
+}
+
+func newTestJobInfo(id int32, nodeName string, external bool) slurmapi.V0044JobInfo {
+	job := slurmapi.V0044JobInfo{
+		JobId:    ptr.To(id),
+		Nodes:    ptr.To(nodeName),
+		JobState: ptr.To([]slurmapi.V0044JobInfoJobState{slurmapi.V0044JobInfoJobStateRUNNING}),
+	}
+	if external {
+		job.Flags = ptr.To([]slurmapi.V0044JobInfoFlags{slurmapi.V0044JobInfoFlagsEXTERNALJOB})
+	}
+	return job
+}
+
+func TestNodeSetReconciler_processCondemned_UpdateIgnoreExternalJobs(t *testing.T) {
+	controller := &slinkyv1beta1.Controller{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "slurm",
+		},
+	}
+	tests := []struct {
+		name      string
+		annotate  bool
+		reason    condemnReason
+		nativeJob bool
+		// podNetworkStatefulSet: Slurm node name is the pod hostname, not
+		// tied to the host.
+		podNetworkStatefulSet bool
+		noScalingModeLabel    bool
+		wantDelete            bool
+	}{
+		{name: "replace, opted in, external jobs only: delete", annotate: true, reason: condemnReplace, wantDelete: true},
+		{name: "replace, opted in, native job running: wait", annotate: true, reason: condemnReplace, nativeJob: true},
+		{name: "replace, not opted in: wait", reason: condemnReplace},
+		{name: "remove, opted in: wait", annotate: true, reason: condemnRemove},
+		{name: "recreate, opted in: wait", annotate: true, reason: condemnRecreate},
+		{name: "replace, opted in, StatefulSet on the pod network: wait", annotate: true, reason: condemnReplace, podNetworkStatefulSet: true},
+		{name: "replace, opted in, no scaling mode label: wait", annotate: true, reason: condemnReplace, noScalingModeLabel: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			nodeset := newNodeSet("foo", controller.Name, 2)
+			nodeset.Spec.ScaleStrategy.Mode = slinkyv1beta1.ScalingModeDaemonset
+			if tt.annotate {
+				nodeset.Annotations = map[string]string{slinkyv1beta1.AnnotationUpdateIgnoreExternalJobs: "true"}
+			}
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Namespace: corev1.NamespaceDefault, Name: "pod-0", Labels: map[string]string{}},
+				Spec:       corev1.PodSpec{Hostname: "foo-0", NodeName: "foo-0"},
+				Status: corev1.PodStatus{
+					Phase:      corev1.PodRunning,
+					Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+				},
+			}
+			switch {
+			case tt.podNetworkStatefulSet:
+				pod.Labels[slinkyv1beta1.LabelNodeSetScalingMode] = string(slinkyv1beta1.ScalingModeStatefulset)
+			case tt.noScalingModeLabel:
+			default:
+				pod.Labels[slinkyv1beta1.LabelNodeSetScalingMode] = string(slinkyv1beta1.ScalingModeDaemonset)
+			}
+			kubeNode := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "foo-0"}}
+			kclient := fake.NewFakeClient(nodeset, kubeNode, &corev1.PodList{Items: []corev1.Pod{*pod}})
+			nodeName := nodesetutils.GetSlurmNodeName(pod)
+			slurmNodeList := &slurmapi.V0044NodeObjectList{Items: []slurmapi.V0044Node{{
+				Name:  ptr.To(nodeName),
+				State: ptr.To([]slurmapi.V0044NodeState{slurmapi.V0044NodeStateMIXED, slurmapi.V0044NodeStateDRAIN}),
+			}}}
+			jobList := &slurmapi.V0044JobInfoObjectList{Items: []slurmapi.V0044JobInfo{newTestJobInfo(1, nodeName, true)}}
+			if tt.nativeJob {
+				jobList.Items = append(jobList.Items, newTestJobInfo(2, nodeName, false))
+			}
+			slurmClient := newFakeClientList(sinterceptor.Funcs{}, slurmNodeList, jobList)
+			r := newNodeSetController(kclient, newClientMap(controller.Name, slurmClient))
+
+			// Through doPodScaleFor: external jobs are checked after the batch.
+			err := r.doPodScaleFor(context.TODO(), nodeset, []*corev1.Pod{pod}, nil, condemnAll(tt.reason))
+			require.NoError(t, err)
+			err = r.Get(context.TODO(), client.ObjectKeyFromObject(pod), &corev1.Pod{})
+			deleted := apierrors.IsNotFound(err)
+			if !deleted {
+				require.NoError(t, err)
+			}
+			require.Equal(t, tt.wantDelete, deleted)
+		})
+	}
+}
+
+// TestNodeSetReconciler_UpdateIgnoreExternalJobs_Strategies checks that every
+// pod the update strategy replaces honors AnnotationUpdateIgnoreExternalJobs,
+// while scale-in keeps waiting for a full drain.
+func TestNodeSetReconciler_UpdateIgnoreExternalJobs_Strategies(t *testing.T) {
+	controller := &slinkyv1beta1.Controller{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "slurm",
+		},
+	}
+	const (
+		hash        = "12345"
+		reservation = "SlurmOperatorMaint-foo"
+	)
+	type path int
+	const (
+		rollingOutdated path = iota
+		rollingUnhealthy
+		scheduledReserved
+		scheduledReservedCurrent
+		scheduledUnhealthy
+		scaleIn
+	)
+	paths := []struct {
+		name string
+		path path
+	}{
+		{name: "RollingUpdate outdated pod", path: rollingOutdated},
+		{name: "RollingUpdate unhealthy pod", path: rollingUnhealthy},
+		{name: "ScheduledUpdate pod under reservation", path: scheduledReserved},
+		{name: "ScheduledUpdate current-revision pod under reservation", path: scheduledReservedCurrent},
+		{name: "ScheduledUpdate unhealthy pod", path: scheduledUnhealthy},
+		{name: "scale-in", path: scaleIn},
+	}
+	cases := []struct {
+		name      string
+		annotate  bool
+		nativeJob bool
+		// wantDelete applies to the update paths; scale-in never deletes
+		// while jobs remain.
+		wantDelete bool
+	}{
+		{name: "opted in, external jobs only", annotate: true, wantDelete: true},
+		{name: "opted in, native job running", annotate: true, nativeJob: true},
+		{name: "not opted in", annotate: false},
+	}
+	for _, p := range paths {
+		for _, tc := range cases {
+			t.Run(p.name+"/"+tc.name, func(t *testing.T) {
+				ctx := context.TODO()
+				nodeset := newNodeSet("foo", controller.Name, 1)
+				nodeset.Spec.Template.PodSpecWrapper.HostNetwork = true
+				if tc.annotate {
+					nodeset.Annotations = map[string]string{slinkyv1beta1.AnnotationUpdateIgnoreExternalJobs: "true"}
+				}
+				switch p.path {
+				case rollingOutdated, rollingUnhealthy:
+					nodeset.Spec.UpdateStrategy.Type = slinkyv1beta1.RollingUpdateNodeSetStrategyType
+					nodeset.Spec.UpdateStrategy.RollingUpdate = slinkyv1beta1.RollingUpdateNodeSetStrategy{
+						MaxUnavailable: ptr.To(intstr.FromInt32(1)),
+					}
+				case scheduledReserved, scheduledReservedCurrent, scheduledUnhealthy:
+					nodeset.Spec.UpdateStrategy.Type = slinkyv1beta1.ScheduledUpdateNodeSetStrategyType
+					nodeset.Spec.UpdateStrategy.ScheduledUpdate = slinkyv1beta1.ScheduledUpdateNodeSetStrategy{
+						StartTime: metav1.Time{Time: time.Now()},
+					}
+				}
+
+				// An outdated pod (empty revision) whose Slurm node name is
+				// tied to its host.
+				pod := nodesetutils.NewNodeSetStatefulSetPod(fake.NewFakeClient(), nodeset, controller, 0, "")
+				pod.Spec.HostNetwork = true
+				pod.Spec.NodeName = "host-0"
+				if p.path == scheduledReservedCurrent {
+					// Already at the current revision: only recreated for the
+					// maintenance window, never ignoring external jobs.
+					pod.Labels[history.ControllerRevisionHashLabel] = hash
+				}
+				switch p.path {
+				case rollingUnhealthy, scheduledUnhealthy:
+					pod.Status.Phase = corev1.PodRunning
+				default:
+					makePodHealthy(pod)
+				}
+				nodeName := nodesetutils.GetSlurmNodeName(pod)
+
+				states := []slurmapi.V0044NodeState{slurmapi.V0044NodeStateMIXED, slurmapi.V0044NodeStateDRAIN}
+				slurmNode := slurmapi.V0044Node{Name: ptr.To(nodeName)}
+				if p.path == scheduledReserved || p.path == scheduledReservedCurrent {
+					states = append(states, slurmapi.V0044NodeStateMAINTENANCE)
+					slurmNode.Reservation = ptr.To(reservation)
+				}
+				slurmNode.State = ptr.To(states)
+				jobList := &slurmapi.V0044JobInfoObjectList{Items: []slurmapi.V0044JobInfo{newTestJobInfo(1, nodeName, true)}}
+				if tc.nativeJob {
+					jobList.Items = append(jobList.Items, newTestJobInfo(2, nodeName, false))
+				}
+				reservationList := &slurmapi.V0044ReservationInfoObjectList{
+					Items: []slurmapi.V0044ReservationInfo{{Name: ptr.To(reservation)}},
+				}
+				slurmClient := newFakeClientList(sinterceptor.Funcs{},
+					&slurmapi.V0044NodeObjectList{Items: []slurmapi.V0044Node{slurmNode}}, jobList, reservationList)
+				kclient := fake.NewFakeClient(nodeset, pod)
+				r := newNodeSetController(kclient, newClientMap(controller.Name, slurmClient))
+
+				pods := []*corev1.Pod{pod}
+				var err error
+				switch p.path {
+				case rollingOutdated, rollingUnhealthy:
+					err = r.syncRollingUpdate(ctx, nodeset, pods, hash)
+				case scheduledReserved, scheduledReservedCurrent, scheduledUnhealthy:
+					err = r.syncScheduledUpdate(ctx, nodeset, pods, hash)
+				case scaleIn:
+					err = r.doPodScale(ctx, nodeset, pods, nil)
+				}
+				require.NoError(t, err)
+
+				err = r.Get(ctx, client.ObjectKeyFromObject(pod), &corev1.Pod{})
+				deleted := apierrors.IsNotFound(err)
+				if !deleted {
+					require.NoError(t, err)
+				}
+				want := tc.wantDelete && p.path != scaleIn && p.path != scheduledReservedCurrent
+				require.Equal(t, want, deleted)
+			})
+		}
+	}
+}
+
+// TestNodeSetReconciler_UpdateIgnoreExternalJobs_Bookkeeping checks the
+// deletion expectations, requeues and drain reasons of the external-jobs
+// batch: deleted pods stay expected until the informer sees them, waiting pods
+// are observed right away and requeue the NodeSet.
+func TestNodeSetReconciler_UpdateIgnoreExternalJobs_Bookkeeping(t *testing.T) {
+	controller := &slinkyv1beta1.Controller{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "slurm",
+		},
+	}
+	newPod := func(name, hostname string) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: corev1.NamespaceDefault,
+				Name:      name,
+				Labels:    map[string]string{slinkyv1beta1.LabelNodeSetScalingMode: string(slinkyv1beta1.ScalingModeDaemonset)},
+			},
+			Spec: corev1.PodSpec{Hostname: hostname, NodeName: hostname},
+			Status: corev1.PodStatus{
+				Phase:      corev1.PodRunning,
+				Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+			},
+		}
+	}
+	tests := []struct {
+		name string
+		// processing deletes through doPodProcessing (scaling mode switch)
+		// instead of doPodScaleFor.
+		processing bool
+		reason     condemnReason
+		listJobErr bool
+		wantErr    bool
+		// wantDeleted are the pods deleted; the others wait.
+		wantDeleted []string
+		wantReason  string
+	}{
+		{
+			name:        "replace, mixed batch",
+			reason:      condemnReplace,
+			wantDeleted: []string{"pod-0"},
+			wantReason:  "pending termination for update",
+		},
+		{
+			name:       "remove (scale-in)",
+			reason:     condemnRemove,
+			wantReason: "pending termination for scale-in",
+		},
+		{
+			name:       "replace, job list fails",
+			reason:     condemnReplace,
+			listJobErr: true,
+			wantErr:    true,
+			wantReason: "pending termination for update",
+		},
+		{
+			name:       "scaling mode switch",
+			processing: true,
+			wantReason: "pending termination for scale-in",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.TODO()
+			nodeset := newNodeSet("foo", controller.Name, 2)
+			nodeset.Spec.ScaleStrategy.Mode = slinkyv1beta1.ScalingModeDaemonset
+			nodeset.Annotations = map[string]string{slinkyv1beta1.AnnotationUpdateIgnoreExternalJobs: "true"}
+			// pod-0's node holds only an external job; pod-1's also holds a
+			// job launched by slurmd.
+			pod0, pod1 := newPod("pod-0", "foo-0"), newPod("pod-1", "foo-1")
+			name0, name1 := nodesetutils.GetSlurmNodeName(pod0), nodesetutils.GetSlurmNodeName(pod1)
+			drained := func(name string) slurmapi.V0044Node {
+				return slurmapi.V0044Node{
+					Name:  ptr.To(name),
+					State: ptr.To([]slurmapi.V0044NodeState{slurmapi.V0044NodeStateMIXED, slurmapi.V0044NodeStateDRAIN}),
+				}
+			}
+			nodeList := &slurmapi.V0044NodeObjectList{Items: []slurmapi.V0044Node{drained(name0), drained(name1)}}
+			jobList := &slurmapi.V0044JobInfoObjectList{Items: []slurmapi.V0044JobInfo{
+				newTestJobInfo(1, name0, true),
+				newTestJobInfo(2, name1, true),
+				newTestJobInfo(3, name1, false),
+			}}
+			funcs := sinterceptor.Funcs{}
+			if tt.listJobErr {
+				funcs.List = func(context.Context, slurmobject.ObjectList, ...slurmclient.ListOption) error {
+					return errors.New("slurmrestd unavailable")
+				}
+			}
+			slurmClient := newFakeClientList(funcs, nodeList, jobList)
+			kclient := fake.NewFakeClient(nodeset, pod0, pod1,
+				&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "foo-0"}},
+				&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "foo-1"}})
+			r := newNodeSetController(kclient, newClientMap(controller.Name, slurmClient))
+			key := objectutils.KeyFunc(nodeset)
+			durationStore.Pop(key)
+
+			pods := []*corev1.Pod{pod0, pod1}
+			var err error
+			if tt.processing {
+				err = r.doPodProcessing(ctx, nodeset, pods, pods)
+			} else {
+				err = r.doPodScaleFor(ctx, nodeset, pods, nil, condemnAll(tt.reason))
+			}
+			if tt.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+
+			deleted := sets.New[string]()
+			for _, pod := range pods {
+				getErr := r.Get(ctx, client.ObjectKeyFromObject(pod), &corev1.Pod{})
+				if apierrors.IsNotFound(getErr) {
+					deleted.Insert(pod.Name)
+				} else {
+					require.NoError(t, getErr)
+				}
+			}
+			require.Equal(t, sets.New(tt.wantDeleted...), deleted)
+
+			// Deleted pods stay expected until the informer sees the delete;
+			// waiting pods were observed at once.
+			wantPending := sets.New[string]()
+			for _, name := range tt.wantDeleted {
+				wantPending.Insert(corev1.NamespaceDefault + "/" + name)
+			}
+			require.Equal(t, wantPending, sets.New(r.expectations.GetUIDs(key).UnsortedList()...))
+			// A waiting pod requeues the NodeSet.
+			require.Equal(t, 30*time.Second, durationStore.Pop(key))
+
+			node := &slurmapi.V0044Node{}
+			require.NoError(t, slurmClient.Get(ctx, slurmclient.ObjectKey(name1), node))
+			require.Contains(t, ptr.Deref(node.Reason, ""), tt.wantReason)
+		})
+	}
+}
+
+// TestNodeSetReconciler_syncScheduledUpdate_SingleExpectations checks that a
+// ScheduledUpdate deletes outdated and current-revision pods under its
+// reservation with one set of deletion expectations, so the second group does
+// not overwrite the first.
+func TestNodeSetReconciler_syncScheduledUpdate_SingleExpectations(t *testing.T) {
+	controller := &slinkyv1beta1.Controller{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "slurm",
+		},
+	}
+	const (
+		hash        = "12345"
+		reservation = "SlurmOperatorMaint-foo"
+	)
+	ctx := context.TODO()
+	nodeset := newNodeSet("foo", controller.Name, 2)
+	nodeset.Spec.Template.PodSpecWrapper.HostNetwork = true
+	nodeset.Annotations = map[string]string{slinkyv1beta1.AnnotationUpdateIgnoreExternalJobs: "true"}
+	nodeset.Spec.UpdateStrategy.Type = slinkyv1beta1.ScheduledUpdateNodeSetStrategyType
+	nodeset.Spec.UpdateStrategy.ScheduledUpdate = slinkyv1beta1.ScheduledUpdateNodeSetStrategy{
+		StartTime: metav1.Time{Time: time.Now()},
+	}
+	newPod := func(ordinal int, revision string) *corev1.Pod {
+		pod := nodesetutils.NewNodeSetStatefulSetPod(fake.NewFakeClient(), nodeset, controller, ordinal, revision)
+		pod.Spec.HostNetwork = true
+		pod.Spec.NodeName = fmt.Sprintf("host-%d", ordinal)
+		pod.Labels[history.ControllerRevisionHashLabel] = revision
+		return makePodHealthy(pod)
+	}
+	// Both nodes hold only an external job, under the maintenance reservation.
+	outdated, current := newPod(0, "old"), newPod(1, hash)
+	var nodes []slurmapi.V0044Node
+	var jobs []slurmapi.V0044JobInfo
+	for i, pod := range []*corev1.Pod{outdated, current} {
+		name := nodesetutils.GetSlurmNodeName(pod)
+		nodes = append(nodes, slurmapi.V0044Node{
+			Name: ptr.To(name),
+			State: ptr.To([]slurmapi.V0044NodeState{
+				slurmapi.V0044NodeStateMIXED, slurmapi.V0044NodeStateDRAIN, slurmapi.V0044NodeStateMAINTENANCE,
+			}),
+			Reservation: ptr.To(reservation),
+		})
+		jobs = append(jobs, newTestJobInfo(int32(i+1), name, true))
+	}
+	slurmClient := newFakeClientList(sinterceptor.Funcs{},
+		&slurmapi.V0044NodeObjectList{Items: nodes},
+		&slurmapi.V0044JobInfoObjectList{Items: jobs},
+		&slurmapi.V0044ReservationInfoObjectList{Items: []slurmapi.V0044ReservationInfo{{Name: ptr.To(reservation)}}})
+	kclient := fake.NewFakeClient(nodeset, outdated, current)
+	r := newNodeSetController(kclient, newClientMap(controller.Name, slurmClient))
+	key := objectutils.KeyFunc(nodeset)
+
+	require.NoError(t, r.syncScheduledUpdate(ctx, nodeset, []*corev1.Pod{outdated, current}, hash))
+
+	// The outdated pod is replaced; the current-revision one waits for a
+	// full drain.
+	err := r.Get(ctx, client.ObjectKeyFromObject(outdated), &corev1.Pod{})
+	require.True(t, apierrors.IsNotFound(err), "outdated pod should be deleted, got %v", err)
+	require.NoError(t, r.Get(ctx, client.ObjectKeyFromObject(current), &corev1.Pod{}))
+	// The outdated pod's deletion is still expected.
+	require.Equal(t, sets.New(kubecontroller.PodKey(outdated)), sets.New(r.expectations.GetUIDs(key).UnsortedList()...))
+}
+
+// TestNodeSetReconciler_UpdateIgnoreExternalJobs_SameSlurmNode checks that an
+// update only ignores external jobs for a pod whose replacement registers the
+// same Slurm node name on the same host, and never for a pod the scale path
+// removes in the same reconcile.
+func TestNodeSetReconciler_UpdateIgnoreExternalJobs_SameSlurmNode(t *testing.T) {
+	controller := &slinkyv1beta1.Controller{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "slurm",
+		},
+	}
+	const hash = "12345"
+	tests := []struct {
+		name      string
+		daemonSet bool
+		// hostnameOverride is set on the Kubernetes node (DaemonSet).
+		hostnameOverride string
+		// templateHostNetwork is the update's hostNetwork (StatefulSet).
+		templateHostNetwork bool
+		// scaleInFirst removes the pod through the scale path earlier in the
+		// same reconcile.
+		scaleInFirst bool
+		// otherReconcile records the scale-in in another reconcile's context.
+		otherReconcile bool
+		wantDelete     bool
+	}{
+		{name: "StatefulSet with hostNetwork kept: replaced", templateHostNetwork: true, wantDelete: true},
+		{name: "StatefulSet hostNetwork flipped off: waits"},
+		{name: "StatefulSet scaled in and updated in one reconcile: waits", templateHostNetwork: true, scaleInFirst: true},
+		{name: "StatefulSet scaled in by another reconcile: replaced", templateHostNetwork: true, scaleInFirst: true, otherReconcile: true, wantDelete: true},
+		{name: "DaemonSet hostname unchanged: replaced", daemonSet: true, wantDelete: true},
+		{name: "DaemonSet hostname override changed: waits", daemonSet: true, hostnameOverride: "renamed-0"},
+		{name: "DaemonSet scaled in and updated in one reconcile: waits", daemonSet: true, scaleInFirst: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			nodeset := newNodeSet("foo", controller.Name, 1)
+			nodeset.Annotations = map[string]string{slinkyv1beta1.AnnotationUpdateIgnoreExternalJobs: "true"}
+			nodeset.Spec.UpdateStrategy.Type = slinkyv1beta1.RollingUpdateNodeSetStrategyType
+			nodeset.Spec.UpdateStrategy.RollingUpdate = slinkyv1beta1.RollingUpdateNodeSetStrategy{
+				MaxUnavailable: ptr.To(intstr.FromInt32(1)),
+			}
+			kubeNode := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "host-0"}}
+			var pod *corev1.Pod
+			if tt.daemonSet {
+				nodeset.Spec.ScaleStrategy.Mode = slinkyv1beta1.ScalingModeDaemonset
+				if tt.hostnameOverride != "" {
+					kubeNode.Annotations = map[string]string{slinkyv1beta1.AnnotationNodeHostnameOverride: tt.hostnameOverride}
+				}
+				// An outdated pod (empty revision) created before the override.
+				pod = nodesetutils.NewNodeSetDaemonSetPod(fake.NewFakeClient(), nodeset, controller, kubeNode.Name, "", "")
+				pod.Name = "foo-host-0" // generated by the API server otherwise
+			} else {
+				nodeset.Spec.Template.PodSpecWrapper.HostNetwork = true
+				pod = nodesetutils.NewNodeSetStatefulSetPod(fake.NewFakeClient(), nodeset, controller, 0, "")
+				nodeset.Spec.Template.PodSpecWrapper.HostNetwork = tt.templateHostNetwork
+			}
+			pod.Spec.NodeName = kubeNode.Name
+			makePodHealthy(pod)
+			nodeName := nodesetutils.GetSlurmNodeName(pod)
+
+			slurmClient := newFakeClientList(sinterceptor.Funcs{},
+				&slurmapi.V0044NodeObjectList{Items: []slurmapi.V0044Node{{
+					Name:  ptr.To(nodeName),
+					State: ptr.To([]slurmapi.V0044NodeState{slurmapi.V0044NodeStateMIXED, slurmapi.V0044NodeStateDRAIN}),
+				}}},
+				&slurmapi.V0044JobInfoObjectList{Items: []slurmapi.V0044JobInfo{newTestJobInfo(1, nodeName, true)}})
+			kclient := fake.NewFakeClient(nodeset, pod, kubeNode)
+			r := newNodeSetController(kclient, newClientMap(controller.Name, slurmClient))
+
+			ctx := withPodRemovals(context.TODO())
+			if tt.scaleInFirst {
+				scaleCtx := ctx
+				if tt.otherReconcile {
+					scaleCtx = withPodRemovals(context.TODO())
+				}
+				// The scale path condemns the pod for removal and waits for
+				// a full drain.
+				require.NoError(t, r.doPodScale(scaleCtx, nodeset, []*corev1.Pod{pod}, nil))
+				require.NoError(t, r.Get(ctx, client.ObjectKeyFromObject(pod), &corev1.Pod{}))
+			}
+			require.NoError(t, r.syncRollingUpdate(ctx, nodeset, []*corev1.Pod{pod}, hash))
+
+			err := r.Get(ctx, client.ObjectKeyFromObject(pod), &corev1.Pod{})
+			deleted := apierrors.IsNotFound(err)
+			if !deleted {
+				require.NoError(t, err)
+			}
+			require.Equal(t, tt.wantDelete, deleted)
+		})
+	}
+}
+
+func Test_updateIgnoresExternalJobs(t *testing.T) {
+	tests := []struct {
+		value string
+		set   bool
+		want  bool
+	}{
+		{set: false, want: false},
+		{value: "true", set: true, want: true},
+		{value: "True", set: true, want: true},
+		{value: "1", set: true, want: true},
+		{value: "false", set: true, want: false},
+		{value: "yes", set: true, want: false},
+		{value: "", set: true, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("%q set=%t", tt.value, tt.set), func(t *testing.T) {
+			nodeset := newNodeSet("foo", "slurm", 1)
+			if tt.set {
+				nodeset.Annotations = map[string]string{slinkyv1beta1.AnnotationUpdateIgnoreExternalJobs: tt.value}
+			}
+			require.Equal(t, tt.want, updateIgnoresExternalJobs(context.TODO(), nodeset))
 		})
 	}
 }

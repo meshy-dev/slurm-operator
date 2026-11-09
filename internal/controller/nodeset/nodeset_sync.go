@@ -10,6 +10,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -109,6 +110,10 @@ func (r *NodeSetReconciler) Sync(ctx context.Context, req reconcile.Request) err
 	if !r.expectations.SatisfiedExpectations(logger, key) || nodeset.DeletionTimestamp != nil {
 		return r.syncStatus(ctx, nodeset, nodesetPods, currentRevision, updateRevision, collisionCount, hash)
 	}
+
+	// Pods the scale path removes in sync() must not be treated as pods the
+	// update strategy replaces in syncUpdate() (see doPodScaleFor).
+	ctx = withPodRemovals(ctx)
 
 	if err := r.sync(ctx, nodeset, nodesetPods, hash); err != nil {
 		return r.syncStatus(ctx, nodeset, nodesetPods, currentRevision, updateRevision, collisionCount, hash, err)
@@ -1336,12 +1341,212 @@ func (r *NodeSetReconciler) doPodScale(
 	nodeset *slinkyv1beta1.NodeSet,
 	podsToDelete, podsToCreate []*corev1.Pod,
 ) error {
+	return r.doPodScaleFor(ctx, nodeset, podsToDelete, podsToCreate, condemnAll(condemnRemove))
+}
+
+// doPodReplace deletes NodeSet pods that the update strategy replaces with a
+// pod of the current revision (outdated or unhealthy pods), as opposed to
+// removing them (scale-in). See condemnReplace.
+func (r *NodeSetReconciler) doPodReplace(
+	ctx context.Context,
+	nodeset *slinkyv1beta1.NodeSet,
+	podsToReplace []*corev1.Pod,
+) error {
+	return r.doPodScaleFor(ctx, nodeset, podsToReplace, nil, condemnAll(condemnReplace))
+}
+
+// condemnReason is why a condemned NodeSet pod is deleted.
+type condemnReason int
+
+const (
+	// condemnRemove removes the pod (e.g. scale-in): its Slurm node must
+	// drain fully first.
+	condemnRemove condemnReason = iota
+	// condemnRecreate deletes a pod for the update strategy whose Slurm node
+	// must still drain fully first: a pod of the current revision (e.g. a
+	// ScheduledUpdate maintenance window), or one whose replacement would
+	// register a different Slurm node name (see replacementKeepsSlurmNode).
+	condemnRecreate
+	// condemnReplace replaces an outdated or unhealthy pod with one of the
+	// current revision (update strategy). With
+	// AnnotationUpdateIgnoreExternalJobs, external jobs left on its drained
+	// Slurm node do not hold the deletion back.
+	condemnReplace
+)
+
+// condemnAll gives every condemned pod the same reason (see doPodScaleFor).
+func condemnAll(reason condemnReason) func(*corev1.Pod) condemnReason {
+	return func(*corev1.Pod) condemnReason { return reason }
+}
+
+// String describes the reason in drain reasons and logs.
+func (c condemnReason) String() string {
+	if c == condemnRemove {
+		return "scale-in"
+	}
+	return "update"
+}
+
+// podRemovals records, for one reconcile, the pods the scale path removes
+// (scale-in, a DaemonSet node that no longer qualifies or whose hostname
+// changed, a scaling mode switch). The scale path runs before the update
+// strategy and picks the same pods again on every reconcile until they are
+// gone, so a pod recorded here is never treated as a replacement. Safe for
+// concurrent use.
+type podRemovals struct {
+	mu   sync.Mutex
+	keys set.Set[string]
+}
+
+type podRemovalsKey struct{}
+
+// withPodRemovals returns ctx carrying an empty podRemovals for one reconcile.
+func withPodRemovals(ctx context.Context) context.Context {
+	return context.WithValue(ctx, podRemovalsKey{}, &podRemovals{keys: set.New[string]()})
+}
+
+// markPodRemoved records that the scale path removes pod in this reconcile.
+func markPodRemoved(ctx context.Context, pod *corev1.Pod) {
+	removals, ok := ctx.Value(podRemovalsKey{}).(*podRemovals)
+	if !ok {
+		return
+	}
+	removals.mu.Lock()
+	defer removals.mu.Unlock()
+	removals.keys.Insert(kubecontroller.PodKey(pod))
+}
+
+// isPodRemoved reports whether the scale path removes pod in this reconcile.
+func isPodRemoved(ctx context.Context, pod *corev1.Pod) bool {
+	removals, ok := ctx.Value(podRemovalsKey{}).(*podRemovals)
+	if !ok {
+		return false
+	}
+	removals.mu.Lock()
+	defer removals.mu.Unlock()
+	return removals.keys.Has(kubecontroller.PodKey(pod))
+}
+
+// replacementKeepsSlurmNode reports whether the pod that replaces pod would
+// register the same Slurm node name on the same host, so a retained
+// allocation on that node stays with the host it describes. Otherwise the
+// old Slurm node name would keep the allocation while the replacement offers
+// the same host under another name.
+//   - DaemonSet: the replacement on the same Kubernetes node uses the hostname
+//     the node's AnnotationNodeHostnameOverride gives now.
+//   - StatefulSet: only with hostNetwork, where the Slurm node name is the
+//     Kubernetes node name, and only if the update keeps hostNetwork.
+func (r *NodeSetReconciler) replacementKeepsSlurmNode(
+	ctx context.Context,
+	nodeset *slinkyv1beta1.NodeSet,
+	pod *corev1.Pod,
+) (bool, error) {
+	podMode := slinkyv1beta1.ScalingModeType(pod.Labels[slinkyv1beta1.LabelNodeSetScalingMode])
+	if podMode != nodeset.Spec.ScaleStrategy.Mode || !nodesetutils.IsSlurmNodeHostBound(pod) {
+		return false, nil
+	}
+	switch podMode {
+	case slinkyv1beta1.ScalingModeStatefulset:
+		return nodeset.Spec.Template.PodSpecWrapper.HostNetwork, nil
+	case slinkyv1beta1.ScalingModeDaemonset:
+		if pod.Spec.NodeName == "" {
+			return false, nil
+		}
+		node := &corev1.Node{}
+		if err := r.Get(ctx, types.NamespacedName{Name: pod.Spec.NodeName}, node); err != nil {
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
+			return false, err
+		}
+		hostnameOverride := node.Annotations[slinkyv1beta1.AnnotationNodeHostnameOverride]
+		expected := nodesetutils.GetDaemonSetPodHostname(node.Name, hostnameOverride)
+		return nodesetutils.GetSlurmNodeName(pod) == expected, nil
+	default:
+		return false, nil
+	}
+}
+
+// condemnReasons returns why each of pods is deleted. A pod the update
+// strategy replaces only keeps condemnReplace (external jobs need not end
+// first) when the NodeSet opted in with AnnotationUpdateIgnoreExternalJobs and
+// the pod really is replaced in place. A pod the scale path removes in this
+// reconcile becomes condemnRemove; otherwise, without the opt-in or when the
+// replacement would register another Slurm node name, it becomes
+// condemnRecreate. Pods with condemnRemove are recorded for the update
+// strategy to see.
+func (r *NodeSetReconciler) condemnReasons(
+	ctx context.Context,
+	nodeset *slinkyv1beta1.NodeSet,
+	pods []*corev1.Pod,
+	reasonOf func(*corev1.Pod) condemnReason,
+) ([]condemnReason, error) {
+	logger := log.FromContext(ctx)
+	ignoreExternalJobs := updateIgnoresExternalJobs(ctx, nodeset)
+	reasons := make([]condemnReason, len(pods))
+	for i, pod := range pods {
+		reason := reasonOf(pod)
+		switch {
+		case reason == condemnRemove:
+			markPodRemoved(ctx, pod)
+		case reason != condemnReplace:
+		case isPodRemoved(ctx, pod):
+			reason = condemnRemove
+		case !ignoreExternalJobs:
+			// Same handling as condemnReplace without the opt-in.
+			reason = condemnRecreate
+		default:
+			keeps, err := r.replacementKeepsSlurmNode(ctx, nodeset, pod)
+			if err != nil {
+				return nil, err
+			}
+			if !keeps {
+				logger.V(2).Info("Not ignoring external jobs for update: the replacement would not register the same Slurm node name on this host",
+					"pod", klog.KObj(pod), "annotation", slinkyv1beta1.AnnotationUpdateIgnoreExternalJobs)
+				reason = condemnRecreate
+			}
+		}
+		reasons[i] = reason
+	}
+	return reasons, nil
+}
+
+// externalJobsCandidates collects, during one batch of condemned pods, the
+// pods whose drained Slurm node still has jobs, to check them all at once
+// after the batch (see deleteExternalJobsOnlyPods). Safe for concurrent use.
+type externalJobsCandidates struct {
+	mu   sync.Mutex
+	pods []*corev1.Pod
+}
+
+func (c *externalJobsCandidates) add(pod *corev1.Pod) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.pods = append(c.pods, pod)
+}
+
+// doPodScaleFor is doPodScale where reasonOf says why each of podsToDelete is
+// deleted. Deleting pods for different reasons in one call keeps one set of
+// deletion expectations for them.
+func (r *NodeSetReconciler) doPodScaleFor(
+	ctx context.Context,
+	nodeset *slinkyv1beta1.NodeSet,
+	podsToDelete, podsToCreate []*corev1.Pod,
+	reasonOf func(*corev1.Pod) condemnReason,
+) error {
 	logger := log.FromContext(ctx)
 	key := objectutils.KeyFunc(nodeset)
 	errs := []error{}
 
 	numDelete := mathutils.Clamp(len(podsToDelete), 0, burstReplicas)
 	numCreate := mathutils.Clamp(len(podsToCreate), 0, burstReplicas)
+
+	// Every pod is classified (and removals recorded), not only this pass's
+	// burst, so the update strategy sees all the pods the scale path removes.
+	reasons, err := r.condemnReasons(ctx, nodeset, podsToDelete, reasonOf)
+	if err != nil {
+		return err
+	}
 
 	// Snapshot the UIDs (namespace/name) of the pods we're expecting to see
 	// deleted, so we know to record their expectations exactly once either
@@ -1412,10 +1617,18 @@ func (r *NodeSetReconciler) doPodScale(
 		errs = append(errs, err)
 	}
 
+	// Pods replaced for an update may leave external jobs behind on their
+	// drained Slurm node (AnnotationUpdateIgnoreExternalJobs).
+	// condemnReasons only keeps condemnReplace when the NodeSet opted in.
+	var candidates *externalJobsCandidates
+	if slices.Contains(reasons[:numDelete], condemnReplace) {
+		candidates = &externalJobsCandidates{}
+	}
+
 	deletePodFn := func(i int) error {
 		pod := podsToDelete[i]
 		podKey := kubecontroller.PodKey(pod)
-		if err := r.processCondemned(ctx, nodeset, podsToDelete, i); err != nil {
+		if err := r.processCondemned(ctx, nodeset, podsToDelete, i, reasons[i], candidates); err != nil {
 			// Decrement the expected number of deletes because the informer won't observe this deletion
 			r.expectations.DeletionObserved(logger, key, podKey)
 			if !apierrors.IsNotFound(err) {
@@ -1429,7 +1642,54 @@ func (r *NodeSetReconciler) doPodScale(
 	if _, err := batch.SlowStartBatchDefault(numDelete, deletePodFn); err != nil {
 		errs = append(errs, err)
 	}
+	if candidates != nil && len(candidates.pods) > 0 {
+		if err := r.deleteExternalJobsOnlyPods(ctx, nodeset, candidates.pods); err != nil {
+			errs = append(errs, err)
+		}
+	}
 
+	return utilerrors.NewAggregate(errs)
+}
+
+// deleteExternalJobsOnlyPods finishes processCondemned for pods replaced for an
+// update whose drained Slurm node still has jobs: it deletes those whose
+// remaining jobs are all external jobs, and keeps the others waiting. The jobs
+// are read once, after every pod of the batch had its node drained, so no job
+// can have started on those nodes since.
+func (r *NodeSetReconciler) deleteExternalJobsOnlyPods(
+	ctx context.Context,
+	nodeset *slinkyv1beta1.NodeSet,
+	pods []*corev1.Pod,
+) error {
+	logger := log.FromContext(ctx)
+	key := objectutils.KeyFunc(nodeset)
+
+	externalJobsOnly, err := r.slurmControl.GetExternalJobsOnlyNodes(ctx, nodeset, pods)
+	if errors.Is(err, slurmcontrol.ErrNoSlurmClient) || errors.Is(err, slurmerrors.ErrNotFound) {
+		// Nothing is known to hold only external jobs; keep waiting.
+		externalJobsOnly, err = nil, nil
+	}
+
+	errs := []error{}
+	if err != nil {
+		errs = append(errs, err)
+	}
+	for _, pod := range pods {
+		podKey := kubecontroller.PodKey(pod)
+		if err == nil && externalJobsOnly.Has(nodesetutils.GetSlurmNodeName(pod)) {
+			logger.Info("NodeSet Pod is drained except for external jobs, terminating for update",
+				"pod", klog.KObj(pod), "annotation", slinkyv1beta1.AnnotationUpdateIgnoreExternalJobs)
+			if err := r.podControl.DeleteNodeSetPod(ctx, nodeset, pod); err != nil && !apierrors.IsNotFound(err) {
+				// Decrement the expected number of deletes because the informer won't observe this deletion
+				r.expectations.DeletionObserved(logger, key, podKey)
+				errs = append(errs, err)
+			}
+			continue
+		}
+		// Not drained yet: decrement expectations and requeue, as processCondemned does.
+		durationStore.Push(key, 30*time.Second)
+		r.expectations.DeletionObserved(logger, key, podKey)
+	}
 	return utilerrors.NewAggregate(errs)
 }
 
@@ -1523,11 +1783,17 @@ func getPodKeys(pods []*corev1.Pod) []string {
 }
 
 // processCondemned will gracefully terminate the condemned NodeSet pod.
+// reason says why the pod is deleted. For a pod replaced for an update
+// (condemnReplace), a non-nil candidates collects the pod instead of waiting
+// when its drained Slurm node still has jobs, for deleteExternalJobsOnlyPods
+// to check after the batch (AnnotationUpdateIgnoreExternalJobs).
 func (r *NodeSetReconciler) processCondemned(
 	ctx context.Context,
 	nodeset *slinkyv1beta1.NodeSet,
 	condemned []*corev1.Pod,
 	i int,
+	reason condemnReason,
+	candidates *externalJobsCandidates,
 ) error {
 	pod := condemned[i]
 	logger := klog.FromContext(ctx).WithValues("pod", klog.KObj(pod))
@@ -1552,9 +1818,9 @@ func (r *NodeSetReconciler) processCondemned(
 		return err
 	}
 	if !isDrained {
-		logger.V(2).Info("NodeSet Pod is draining, pending termination for scale-in")
-		reason := fmt.Sprintf("Pod (%s) is pending termination for scale-in", klog.KObj(pod))
-		err := r.makePodCondemnedAndDrain(ctx, nodeset, pod, reason, true)
+		logger.V(2).Info("NodeSet Pod is draining, pending termination for " + reason.String())
+		drainReason := fmt.Sprintf("Pod (%s) is pending termination for %s", klog.KObj(pod), reason)
+		err := r.makePodCondemnedAndDrain(ctx, nodeset, pod, drainReason, true)
 		if err != nil {
 			return err
 		}
@@ -1569,6 +1835,16 @@ func (r *NodeSetReconciler) processCondemned(
 	case err != nil:
 		return err
 	}
+	if !isDrained && candidates != nil && reason == condemnReplace {
+		if !nodesetutils.IsSlurmNodeHostBound(pod) {
+			logger.V(3).Info("Not ignoring external jobs for update: the Slurm node name is not tied to its host",
+				"annotation", slinkyv1beta1.AnnotationUpdateIgnoreExternalJobs)
+		} else {
+			// Checked with the rest of the batch, once every node is drained.
+			candidates.add(pod)
+			return nil
+		}
+	}
 	if !isDrained {
 		nodesetKey := objectutils.KeyFunc(nodeset)
 		durationStore.Push(nodesetKey, 30*time.Second)
@@ -1578,13 +1854,40 @@ func (r *NodeSetReconciler) processCondemned(
 		return nil
 	}
 
-	logger.V(2).Info("NodeSet Pod is terminating for scale-in")
+	logger.V(2).Info("NodeSet Pod is terminating for " + reason.String())
 	if err := r.podControl.DeleteNodeSetPod(ctx, nodeset, pod); err != nil {
 		if !apierrors.IsNotFound(err) {
 			return err
 		}
 	}
 	return nil
+}
+
+// updateIgnoresExternalJobs reports whether the NodeSet opted in to replacing
+// pods for an update while external jobs still run on their node. The
+// annotation takes any value strconv.ParseBool accepts; any other value is
+// logged and treated as false.
+func updateIgnoresExternalJobs(ctx context.Context, nodeset *slinkyv1beta1.NodeSet) bool {
+	enabled, err := structutils.GetBoolFromAnnotations(nodeset.GetAnnotations(), slinkyv1beta1.AnnotationUpdateIgnoreExternalJobs)
+	if err != nil {
+		logInvalidUpdateIgnoreExternalJobs(ctx, nodeset)
+	}
+	return enabled
+}
+
+// invalidUpdateIgnoreExternalJobs remembers, per NodeSet, the invalid
+// AnnotationUpdateIgnoreExternalJobs value last logged, so each one is logged
+// once rather than on every sync.
+var invalidUpdateIgnoreExternalJobs sync.Map
+
+func logInvalidUpdateIgnoreExternalJobs(ctx context.Context, nodeset *slinkyv1beta1.NodeSet) {
+	value := nodeset.GetAnnotations()[slinkyv1beta1.AnnotationUpdateIgnoreExternalJobs]
+	key := objectutils.KeyFunc(nodeset)
+	if last, ok := invalidUpdateIgnoreExternalJobs.Swap(key, value); ok && last == value {
+		return
+	}
+	log.FromContext(ctx).V(1).Info("Ignoring invalid annotation value, external jobs are not ignored for update",
+		"annotation", slinkyv1beta1.AnnotationUpdateIgnoreExternalJobs, "value", value)
 }
 
 // doPodProcessing handles batch processing of NodeSet pods.
@@ -1601,10 +1904,15 @@ func (r *NodeSetReconciler) doPodProcessing(
 		return err
 	}
 
+	// Pods of the other scaling mode are removed, not replaced.
+	for _, pod := range podsToDelete {
+		markPodRemoved(ctx, pod)
+	}
+
 	deletePodFn := func(i int) error {
 		pod := podsToDelete[i]
 		podKey := kubecontroller.PodKey(pod)
-		if err := r.processCondemned(ctx, nodeset, podsToDelete, i); err != nil {
+		if err := r.processCondemned(ctx, nodeset, podsToDelete, i, condemnRemove, nil); err != nil {
 			// Decrement the expected number of deletes because the informer won't observe this deletion
 			r.expectations.DeletionObserved(logger, key, podKey)
 			if !apierrors.IsNotFound(err) {
@@ -1891,7 +2199,7 @@ func (r *NodeSetReconciler) syncRollingUpdate(
 	if len(unhealthyPods) > 0 {
 		logger.V(1).Info("Delete unhealthy pods for Rolling Update",
 			"unhealthyPods", len(unhealthyPods))
-		if err := r.doPodScale(ctx, nodeset, unhealthyPods, nil); err != nil {
+		if err := r.doPodReplace(ctx, nodeset, unhealthyPods); err != nil {
 			return err
 		}
 	}
@@ -1900,7 +2208,7 @@ func (r *NodeSetReconciler) syncRollingUpdate(
 	if len(podsToDelete) > 0 {
 		logger.V(1).Info("Scale-in pods for Rolling Update",
 			"delete", len(podsToDelete))
-		if err := r.doPodScale(ctx, nodeset, podsToDelete, nil); err != nil {
+		if err := r.doPodReplace(ctx, nodeset, podsToDelete); err != nil {
 			return err
 		}
 	}
@@ -2063,7 +2371,7 @@ func (r *NodeSetReconciler) syncScheduledUpdate(
 	if len(unhealthyPods) > 0 {
 		logger.V(1).Info("Delete unhealthy pods for Scheduled Update",
 			"unhealthyPods", len(unhealthyPods))
-		if err := r.doPodScale(ctx, nodeset, unhealthyPods, nil); err != nil {
+		if err := r.doPodReplace(ctx, nodeset, unhealthyPods); err != nil {
 			return err
 		}
 	}
@@ -2071,11 +2379,20 @@ func (r *NodeSetReconciler) syncScheduledUpdate(
 	// If reservation is ongoing, handle updates
 	podsToDelete, podsToKeep := r.splitUpdatePods(ctx, nodeset, pods, hash)
 
-	// Handle pod scale-down
+	// Handle pod scale-down in one call, so one set of deletion expectations
+	// covers every pod. Pods already at the current revision are only
+	// recreated for the maintenance window, so they wait for a full drain;
+	// only outdated pods are replaced for the update.
 	if len(podsToDelete) > 0 {
 		logger.V(1).Info("Scale-in pods for Scheduled Update",
 			"delete", len(podsToDelete))
-		if err := r.doPodScale(ctx, nodeset, podsToDelete, nil); err != nil {
+		reasonOf := func(pod *corev1.Pod) condemnReason {
+			if historycontrol.GetRevision(pod.GetLabels()) == hash {
+				return condemnRecreate
+			}
+			return condemnReplace
+		}
+		if err := r.doPodScaleFor(ctx, nodeset, podsToDelete, nil, reasonOf); err != nil {
 			return err
 		}
 	}
