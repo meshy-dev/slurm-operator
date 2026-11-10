@@ -5499,6 +5499,28 @@ func TestNodeSetReconciler_syncSlurmNodeRecordsAutoForNodeNotFound(t *testing.T)
 			},
 			wantErr: true,
 		},
+		{
+			// slurmctld refuses to delete a node that still holds jobs, or is in a
+			// reservation, with ESLURM_NODES_BUSY: skipped, not an error, so the
+			// sync goes on and a later one prunes it.
+			name: "skip node slurmctld refuses to delete while it is busy",
+			setup: func(ns *slinkyv1beta1.NodeSet) ([]runtime.Object, []slurmapi.V0044Node, []string, []string) {
+				defunctPodName := nodesetutils.GetOrdinalPodName(ns, 1)
+				nodes := []slurmapi.V0044Node{
+					{
+						Name:    ptr.To("busy-node"),
+						State:   defunctNodeState,
+						Comment: podInfo(ns, defunctPodName, "worker-a"),
+					},
+				}
+				return nil, nodes, []string{"busy-node"}, nil
+			},
+			interceptor: sinterceptor.Funcs{
+				Delete: func(_ context.Context, _ slurmobject.Object, _ ...slurmclient.DeleteOption) error {
+					return errors.Join(errors.New("Internal Server Error"), errors.New("Requested nodes are busy"))
+				},
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -5803,6 +5825,20 @@ func TestNodeSetReconciler_syncSlurmNodeRecordsAlwaysForPodTermination(t *testin
 				}},
 				nodes:      []slurmapi.V0044Node{slurmNode("gone-node", podInfo(ns, nodesetutils.GetOrdinalPodName(ns, 1)))},
 				wantErr:    "slurm connection refused",
+				stillExist: []string{"gone-node"},
+			}
+		}(),
+		func() testCase {
+			ns := newNodeset()
+			return testCase{
+				// e.g. a DOWN node holding external jobs that kept their
+				// allocation: skipped, not an error, so sync() goes on.
+				name:    "skips node slurmctld refuses to delete while it is busy",
+				nodeset: ns,
+				funcs: sinterceptor.Funcs{Delete: func(context.Context, slurmobject.Object, ...slurmclient.DeleteOption) error {
+					return errors.Join(errors.New("Internal Server Error"), errors.New("Requested nodes are busy"))
+				}},
+				nodes:      []slurmapi.V0044Node{slurmNode("gone-node", podInfo(ns, nodesetutils.GetOrdinalPodName(ns, 1)))},
 				stillExist: []string{"gone-node"},
 			}
 		}(),

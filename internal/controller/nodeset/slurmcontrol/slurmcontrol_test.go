@@ -790,6 +790,31 @@ func Test_realSlurmControl_IsNodeDrained(t *testing.T) {
 			want: true,
 		},
 		{
+			// A DOWN node holding jobs that kept their allocation is reported
+			// DOWN, not ALLOCATED or MIXED.
+			name: "DOWN+DRAIN holding a job",
+			fields: func() fields {
+				node := &api.V0044Node{
+					Name: ptr.To(nodesetutils.GetSlurmNodeName(pod)),
+					State: ptr.To([]api.V0044NodeState{
+						api.V0044NodeStateDOWN,
+						api.V0044NodeStateDRAIN,
+					}),
+					AllocCpus: ptr.To[int32](4),
+				}
+				sclient := fake.NewClientBuilder().WithObjects(node).Build()
+				return fields{
+					clientMap: testutils.NewClientMap(controller.Name, controller.Namespace, sclient),
+				}
+			}(),
+			args: args{
+				ctx:     ctx,
+				nodeset: nodeset,
+				pod:     pod,
+			},
+			want: false,
+		},
+		{
 			name: "MIXED+DRAIN",
 			fields: func() fields {
 				node := &api.V0044Node{
@@ -3719,4 +3744,35 @@ func Test_realSlurmControl_DeleteNodeAlreadyGone(t *testing.T) {
 	err := r.DeleteNode(context.Background(), nodeset, "foo-0")
 
 	require.ErrorIs(t, err, slurmerrors.ErrNotFound)
+}
+
+func Test_realSlurmControl_DeleteNodeBusy(t *testing.T) {
+	controller := &slinkyv1beta1.Controller{ObjectMeta: metav1.ObjectMeta{Name: "slurm"}}
+	nodeset := newNodeSet("foo", controller.Name, 1)
+	node := &api.V0044Node{Name: ptr.To("foo-0")}
+	tests := []struct {
+		name     string
+		err      error
+		wantBusy bool
+	}{
+		// slurm-client joins the HTTP status text with slurmrestd's errors.
+		// slurmctld returns ESLURM_NODES_BUSY both for a node that still holds
+		// jobs and for one in a reservation.
+		{name: "nodes busy", err: errors.Join(errors.New("Internal Server Error"), errors.New("Requested nodes are busy")), wantBusy: true},
+		{name: "other failure", err: errors.Join(errors.New("Internal Server Error"), errors.New("Invalid node state specified"))},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sclient := fake.NewClientBuilder().WithObjects(node).WithInterceptorFuncs(interceptor.Funcs{
+				Delete: func(context.Context, object.Object, ...client.DeleteOption) error { return tt.err },
+			}).Build()
+			r := &realSlurmControl{clientMap: testutils.NewClientMap(controller.Name, nodeset.Namespace, sclient)}
+
+			err := r.DeleteNode(context.Background(), nodeset, "foo-0")
+
+			require.Error(t, err)
+			require.Equal(t, tt.wantBusy, errors.Is(err, ErrNodeBusy))
+			require.ErrorContains(t, err, tt.err.Error())
+		})
+	}
 }

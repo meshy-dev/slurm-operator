@@ -721,6 +721,13 @@ func (r *NodeSetReconciler) syncSlurmNodeRecordsAutoForNodeNotFound(
 				if errors.Is(err, slurmcontrol.ErrNoSlurmClient) || errors.Is(err, slurmerrors.ErrNotFound) {
 					return nil
 				}
+				if errors.Is(err, slurmcontrol.ErrNodeBusy) {
+					// slurmctld keeps a node that still holds jobs or is in a
+					// reservation; prune it on a later sync.
+					logger.Info("Not deleting defunct Slurm node yet: it still holds jobs or is in a reservation",
+						"slurmNode", defunctNode.Name)
+					return nil
+				}
 				return fmt.Errorf("failed to delete defunct Slurm node %s for pod %s/%s on node %s: %w",
 					defunctNode.Name, podKey.Namespace, podKey.Name, kubeNodeKey.Name, err)
 			}
@@ -764,10 +771,16 @@ func (r *NodeSetReconciler) syncSlurmNodeRecordsAutoForInvalidReg(
 		logger.Info("Slurm node has INVALID_REG state, deleting Slurm node record", "node", invalidNode)
 		eventutils.Warning(r.eventRecorder, nodeset, nil, eventutils.ReasonSlurmNodeInvalidReg, eventutils.ActionDelete,
 			"Deleting Slurm node record %s: node has INVALID_REG state.", invalidNode)
-		if err := r.slurmControl.DeleteNode(ctx, nodeset, invalidNode); err != nil &&
-			!errors.Is(err, slurmcontrol.ErrNoSlurmClient) &&
-			!errors.Is(err, slurmerrors.ErrNotFound) {
-			return err
+		if err := r.slurmControl.DeleteNode(ctx, nodeset, invalidNode); err != nil {
+			if errors.Is(err, slurmcontrol.ErrNodeBusy) {
+				logger.Info("Not deleting INVALID_REG Slurm node record yet: it still holds jobs or is in a reservation",
+					"node", invalidNode)
+				return nil
+			}
+			if !errors.Is(err, slurmcontrol.ErrNoSlurmClient) &&
+				!errors.Is(err, slurmerrors.ErrNotFound) {
+				return err
+			}
 		}
 		return nil
 	}
@@ -843,6 +856,13 @@ func (r *NodeSetReconciler) syncSlurmNodeRecordsAlwaysForPodTermination(
 			logger.V(1).Info("Deleting defunct Slurm node without a corresponding Kubernetes Pod")
 			if err := r.slurmControl.DeleteNode(ctx, nodeset, slurmNode.Name); err != nil {
 				if errors.Is(err, slurmcontrol.ErrNoSlurmClient) || errors.Is(err, slurmerrors.ErrNotFound) {
+					return nil
+				}
+				if errors.Is(err, slurmcontrol.ErrNodeBusy) {
+					// slurmctld keeps a node that still holds jobs or is in a
+					// reservation; prune it on a later sync.
+					logger.Info("Not deleting defunct Slurm node yet: it still holds jobs or is in a reservation",
+						"slurmNode", slurmNode.Name, "pod", podKey)
 					return nil
 				}
 				return fmt.Errorf("failed to delete defunct Slurm node %s for pod %s/%s: %w",

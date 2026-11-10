@@ -88,6 +88,22 @@ var ErrNoSlurmClient = errors.New("NoSlurmClient")
 // node in INVALID_REG state, which Slurm rejects with "Invalid node state transition".
 var ErrNodeInvalidReg = errors.New("NodeInvalidReg")
 
+// ErrNodeBusy is returned by DeleteNode when slurmctld refuses to delete a
+// node because it still holds jobs or is in a reservation (ESLURM_NODES_BUSY
+// for both). A node can hold jobs while DOWN, for example external jobs that
+// keep their allocation through a node DOWN.
+var ErrNodeBusy = errors.New("NodeBusy")
+
+// slurmNodesBusyText is slurm_strerror(ESLURM_NODES_BUSY), which slurmrestd
+// returns in the error list; slurm-client passes only the text through.
+const slurmNodesBusyText = "Requested nodes are busy"
+
+// isNodesBusyErr reports whether err is slurmctld refusing an operation
+// because the node is busy.
+func isNodesBusyErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), slurmNodesBusyText)
+}
+
 // realSlurmControl is the default implementation of SlurmControlInterface.
 type realSlurmControl struct {
 	clientMap *clientmap.ClientMap
@@ -421,8 +437,12 @@ func (r *realSlurmControl) IsNodeDrained(ctx context.Context, nodeset *slinkyv1b
 
 	// Drained is when a node has the DRAIN flag and is not doing any work (e.g. job step, prolog, epilog).
 	// https://github.com/SchedMD/slurm/blob/slurm-25.05/src/common/slurm_protocol_defs.c#L3500
+	// A DOWN node can still hold jobs, e.g. external jobs that keep their
+	// allocation through a node DOWN, and is then reported DOWN rather than
+	// ALLOCATED or MIXED, so allocated CPUs also count as work.
 	nodeStates := slurmutils.GetStateAsSet(slurmNode.State)
-	isBusy := nodeStates.HasAny(slurmapi.V0044NodeStateALLOCATED, slurmapi.V0044NodeStateMIXED, slurmapi.V0044NodeStateCOMPLETING)
+	isBusy := nodeStates.HasAny(slurmapi.V0044NodeStateALLOCATED, slurmapi.V0044NodeStateMIXED, slurmapi.V0044NodeStateCOMPLETING) ||
+		ptr.Deref(slurmNode.AllocCpus, 0) > 0
 	isDrain := nodeStates.Has(slurmapi.V0044NodeStateDRAIN) && !nodeStates.Has(slurmapi.V0044NodeStateUNDRAIN)
 	isDrained := isDrain && !isBusy
 
@@ -816,6 +836,9 @@ func (r *realSlurmControl) DeleteNode(ctx context.Context, nodeset *slinkyv1beta
 		Name: new(nodeName),
 	}
 	if err := slurmClient.Delete(ctx, slurmNode); err != nil {
+		if isNodesBusyErr(err) {
+			return fmt.Errorf("%w: %w", ErrNodeBusy, err)
+		}
 		return err
 	}
 
